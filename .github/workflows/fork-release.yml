@@ -239,7 +239,7 @@ jobs:
 
           mac = load('fork-mac/arm64', 'latest-mac.yml', ('-arm64.zip', '-arm64.dmg'))
           intel = load('fork-mac/x64', 'latest-mac.yml', ('-x64.zip', '-x64.dmg'))
-          linux = load('fork-linux', 'latest-linux.yml', ('-x64.AppImage',))
+          linux = load('fork-linux', 'latest-linux.yml', ('-x86_64.AppImage',))
           assert any(item['url'].endswith('-arm64.zip') for item in mac['files'])
           assert any(item['url'].endswith('-x64.zip') for item in intel['files'])
           mac['files'].extend(intel['files'])
