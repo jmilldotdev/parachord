@@ -1,0 +1,45 @@
+name: Fork sync
+
+on:
+  schedule:
+    - cron: '23 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'jmilldotdev/parachord' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      # Only the release dispatch needs Actions write; GitHub merges the fork
+      # with upstream through its dedicated API using Contents write.
+
+      - name: Merge upstream main and dispatch the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          upstream=$(gh api repos/Parachord/parachord/commits/main --jq .sha)
+          if ! response=$(gh api -i --method POST "repos/$GITHUB_REPOSITORY/merge-upstream" -f branch=main 2>&1); then
+            printf '%s\n' "$response"
+            if grep -Eq '^HTTP/[^ ]+ 409( |$)|^gh: .*\(HTTP 409\)' <<< "$response"; then
+              title="Upstream sync conflict ($upstream)"
+              existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --search "\"$title\" in:title" --json title --jq '.[].title')
+              if ! grep -Fxq "$title" <<< "$existing"; then
+                {
+                  printf 'GitHub could not merge upstream `main` (seen at `%s`) into fork `main`. Resolve the merge locally, push it to fork `main`, then run Fork sync again.\n\n' "$upstream"
+                  printf 'Run: %s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+                } | gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file -
+              fi
+            fi
+            exit 1
+          fi
+          printf '%s\n' "$response" | tail -1
+          gh workflow run fork-release.yml --repo "$GITHUB_REPOSITORY" --ref main
