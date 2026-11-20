@@ -42,7 +42,7 @@ jobs:
       matrix:
         include:
           # Both architectures can build on one Apple Silicon runner.
-          - os: macos-latest
+          - os: macos-15
             platform: mac
           - os: ubuntu-latest
             platform: linux
