@@ -41,21 +41,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Both architectures can build on one Apple Silicon runner.
           - os: macos-latest
             platform: mac
-            arch: arm64
-            manifest: latest-mac.yml
-          - os: macos-latest
-            platform: mac
-            arch: x64
-            manifest: latest-mac.yml
           - os: ubuntu-latest
             platform: linux
-            arch: x64
-            manifest: latest-linux.yml
     env:
       FORK_VERSION: ${{ needs.version.outputs.fork }}
-      ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -106,7 +98,7 @@ jobs:
           }
           NODE
 
-      - name: Build macOS package
+      - name: Build macOS arm64 and Intel packages
         if: matrix.platform == 'mac'
         env:
           CSC_LINK: ${{ secrets.CSC_LINK }}
@@ -118,7 +110,7 @@ jobs:
         run: |
           set -euo pipefail
           # Stapling changes DMG bytes. Only ZIPs belong in the macOS update feed.
-          args=( "--$ARCH" --publish never '-c.artifactName=Parachord-${version}-${arch}.${ext}' '-c.dmg.writeUpdateInfo=false' "-c.mac.bundleVersion=${UPSTREAM_VERSION%%[-+]*}" )
+          args=( --publish never '-c.artifactName=Parachord-${version}-${arch}.${ext}' '-c.dmg.writeUpdateInfo=false' "-c.mac.bundleVersion=${UPSTREAM_VERSION%%[-+]*}" )
           if [[ -n "$CSC_LINK" && -n "$CSC_KEY_PASSWORD" && -n "$APPLE_API_KEY_ID" && -n "$APPLE_API_ISSUER" && -n "$APPLE_API_KEY_P8" ]]; then
             umask 077
             cert="$RUNNER_TEMP/fork-signing.p12"
@@ -143,33 +135,36 @@ jobs:
             mode=ad-hoc
           fi
           echo "macOS signature mode: $mode"
-          npm run build:mac -- "${args[@]}"
-          app=(dist/mac*/Parachord.app)
-          test -d "${app[0]}"
-          codesign --verify --deep --strict "${app[0]}"
-          signature=$(codesign -dv --verbose=2 "${app[0]}" 2>&1)
-          if [[ "$mode" == notarized ]]; then
-            grep -q '^Authority=Developer ID Application' <<< "$signature"
-            xcrun stapler validate "${app[0]}"
-            for file in dist/*.dmg dist/*.zip; do
-              result=$(xcrun notarytool submit "$file" --key "$APPLE_API_KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" --wait --output-format json)
-              if ! jq -e '.status == "Accepted"' <<< "$result"; then
-                printf '%s\n' "$result"
-                exit 1
-              fi
-              if [[ "$file" == *.dmg ]]; then
-                xcrun stapler staple "$file"
-                xcrun stapler validate "$file"
-              fi
-            done
-          else
-            grep -Fxq 'Signature=adhoc' <<< "$signature"
-          fi
-          feed="${app[0]}/Contents/Resources/app-update.yml"
-          grep -Fx 'provider: github' "$feed"
-          grep -Fx 'owner: jmilldotdev' "$feed"
-          grep -Fx 'repo: parachord' "$feed"
-          printf '%s\n' "$mode" > "dist/macos-${ARCH}-signing.txt"
+          for arch in arm64 x64; do
+            out="dist/$arch"
+            npm run build:mac -- "--$arch" "-c.directories.output=$out" "${args[@]}"
+            app=("$out"/mac*/Parachord.app)
+            test -d "${app[0]}"
+            codesign --verify --deep --strict "${app[0]}"
+            signature=$(codesign -dv --verbose=2 "${app[0]}" 2>&1)
+            if [[ "$mode" == notarized ]]; then
+              grep -q '^Authority=Developer ID Application' <<< "$signature"
+              xcrun stapler validate "${app[0]}"
+              for file in "$out"/*.dmg "$out"/*.zip; do
+                result=$(xcrun notarytool submit "$file" --key "$APPLE_API_KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" --wait --output-format json)
+                if ! jq -e '.status == "Accepted"' <<< "$result"; then
+                  printf '%s\n' "$result"
+                  exit 1
+                fi
+                if [[ "$file" == *.dmg ]]; then
+                  xcrun stapler staple "$file"
+                  xcrun stapler validate "$file"
+                fi
+              done
+            else
+              grep -Fxq 'Signature=adhoc' <<< "$signature"
+            fi
+            feed="${app[0]}/Contents/Resources/app-update.yml"
+            grep -Fx 'provider: github' "$feed"
+            grep -Fx 'owner: jmilldotdev' "$feed"
+            grep -Fx 'repo: parachord' "$feed"
+          done
+          printf '%s\n' "$mode" > dist/macos-signing.txt
 
       - name: Build Linux AppImage
         if: matrix.platform == 'linux'
@@ -177,16 +172,17 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: fork-${{ matrix.platform }}-${{ matrix.arch }}
+          name: fork-${{ matrix.platform }}
           if-no-files-found: error
           retention-days: 7
           path: |
-            dist/*.dmg
-            dist/*.zip
+            dist/*/*.dmg
+            dist/*/*.zip
+            dist/*/*.blockmap
+            dist/*/latest-mac.yml
+            dist/macos-signing.txt
             dist/*.AppImage
-            dist/*.blockmap
-            dist/macos-*-signing.txt
-            dist/${{ matrix.manifest }}
+            dist/latest-linux.yml
 
   publish:
     needs: [version, build]
@@ -202,6 +198,10 @@ jobs:
         with:
           pattern: fork-*
           path: builds
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
 
       - name: Combine and verify updater manifests
         run: |
@@ -237,9 +237,9 @@ jobs:
                       shutil.move(file, output / file.name)
               return info
 
-          mac = load('fork-mac-arm64', 'latest-mac.yml', ('-arm64.zip', '-arm64.dmg'))
-          intel = load('fork-mac-x64', 'latest-mac.yml', ('-x64.zip', '-x64.dmg'))
-          linux = load('fork-linux-x64', 'latest-linux.yml', ('-x64.AppImage',))
+          mac = load('fork-mac/arm64', 'latest-mac.yml', ('-arm64.zip', '-arm64.dmg'))
+          intel = load('fork-mac/x64', 'latest-mac.yml', ('-x64.zip', '-x64.dmg'))
+          linux = load('fork-linux', 'latest-linux.yml', ('-x64.AppImage',))
           assert any(item['url'].endswith('-arm64.zip') for item in mac['files'])
           assert any(item['url'].endswith('-x64.zip') for item in intel['files'])
           mac['files'].extend(intel['files'])
@@ -260,8 +260,7 @@ jobs:
             echo "::error::$tag is older than $latest; dispatch a new release instead."
             exit 1
           fi
-          mode=$(cat builds/fork-mac-arm64/macos-arm64-signing.txt)
-          test "$mode" = "$(cat builds/fork-mac-x64/macos-x64-signing.txt)"
+          mode=$(cat builds/fork-mac/macos-signing.txt)
           {
             printf 'Fork build from `%s` (upstream package version `%s`).\n\n' "$GITHUB_SHA" "$UPSTREAM_VERSION"
             if [[ "$mode" == ad-hoc ]]; then
