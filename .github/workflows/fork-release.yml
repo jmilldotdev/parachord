@@ -85,7 +85,7 @@ jobs:
               .setProtectedHeader({ alg: 'ES256', kid: env.MUSICKIT_KEY_ID })
               .setIssuer(env.MUSICKIT_TEAM_ID)
               .setIssuedAt()
-              .setExpirationTime('30d')
+              .setExpirationTime('180d') // Apple's maximum is ~6 months; builds can sit installed for weeks without an upstream change
               .sign(key);
             console.log(`::add-mask::${token}`);
           }
