@@ -595,6 +595,9 @@ window.musicbrainzLimiter = window.createLimiter({
 const { mbFetchWithRetries, describeMusicBrainzError } = require('./lib/musicbrainz-fetch');
 const { transition } = require('./lib/motion');
 const { describeProviderError } = require('./lib/ai-provider-errors');
+const { CARD_INLINE_REGEX, wholeLineCard } = require('./lib/chat-card-syntax');
+const { chatLinkTarget } = require('./lib/chat-links');
+const { pickPlaylistCovers } = require('./lib/playlist-cover-picks');
 const { sourceFromUrlHint } = require('./lib/source-url-hint');
 const { isPlayableSource } = require('./lib/playable-source');
 const { CardButton } = require('./components/card-button');
@@ -618,7 +621,7 @@ const { resolversToAskAgain, nextUnanswered } = require('./lib/unanswered-resolv
 const { isMiss, newMiss, isStaleMiss } = require('./lib/cached-miss');
 const { pickRelease } = require('./lib/release-pick');
 const { uniqueReleases, freshDropsWindow, withinFreshDropsWindow } = require('./lib/fresh-drops-releases');
-const { uniqueConcerts, concertSourceKeys, concertMatchesSource } = require('./lib/concert-events');
+const { uniqueConcerts, concertSourceKeys, concertMatchesSource, venueMatchesLocationText } = require('./lib/concert-events');
 const { createReleaseLookup, releaseFormats, hasCurrentAlias } = require('./lib/release-lookup');
 const { artistLookupPlan, loadArtistReleaseGroups, musicBrainzHttpError, discographyOutcome } = require('./lib/artist-discography');
 const { searchMusicBrainzArtists, searchMusicBrainzAlbums, searchMusicBrainzTracks, createPopularityLookup } = require('./lib/search-requests');
@@ -626,7 +629,8 @@ const { shouldAutoRefreshHomeSuggestions } = require('./lib/home-suggestions-ref
 const {
   shouldLoadHomeRecommendations, shouldStampHomeRecommendationsLoad, normalizeHistoryMixes, flattenHistoryMixes,
   historyMixCacheEntry, historyMixEntriesFor, sameHistoryMixEntries, pluginColors, mixesNeedingMosaic, withMixMosaics,
-  HOME_MIX_COVER_ATTEMPTS, HOME_MIX_COVER_RETRY_MS
+  HOME_MIX_COVER_ATTEMPTS, HOME_MIX_COVER_RETRY_MS,
+  mixForContext,
 } = require('./lib/home-model');
 const { sourceBlockId, withoutTrackSource } = require('./lib/bad-match-report');
 const PlaybackLimits = require('./lib/playback-limits');
@@ -17592,7 +17596,7 @@ ${trackListXml}
       // Combined regex for all inline patterns
       // Order matters: cards first, then image links (![]()), then regular links, then bold, then italic, then code
       const patterns = [
-        { regex: /\{\{(track|artist|album|playlist)\|([^}]+)\}\}/g, type: 'card' },
+        { regex: new RegExp(CARD_INLINE_REGEX.source, 'g'), type: 'card' },
         { regex: /!\[([^\]]*)\]\(([^)]+)\)/g, type: 'imagelink' }, // Handle ![text](url) - treat as regular link
         { regex: /\[([^\]]+)\]\(([^)]+)\)/g, type: 'link' },
         { regex: /\*\*([^*]+)\*\*/g, type: 'bold' },
@@ -17689,35 +17693,20 @@ ${trackListXml}
         } else if (r.type === 'link' || r.type === 'imagelink') {
           // Handle both [text](url) and ![text](url) - treat image links as regular links
           const linkText = r.match[1] || r.match[2].split('/').pop(); // Use alt text or extract from URL
-          const url = r.match[2];
-          result.push(
+          // Only http(s) and the parachord:// commands handled below are
+          // links; any other scheme is the link's text, with no href
+          // (lib/chat-links.js, #1581).
+          const target = chatLinkTarget(r.match[2]);
+          result.push(!target ? linkText :
             React.createElement('a', {
               key,
-              href: url,
+              href: target.url,
               onClick: async (e) => {
                 e.preventDefault();
-                if (url.startsWith('parachord://')) {
-                  // Parse and handle protocol URL
+                if (target.kind === 'parachord') {
                   try {
-                    const parsed = new URL(url);
-                    const host = parsed.host;
-                    const pathSegments = parsed.pathname
-                      .replace(/^\/+/, '')
-                      .split('/')
-                      .map(s => decodeURIComponent(s))
-                      .filter(Boolean);
-
-                    let command, segments;
-                    if (host && host !== '') {
-                      command = host;
-                      segments = pathSegments;
-                    } else {
-                      [command, ...segments] = pathSegments;
-                    }
-
-                    const params = Object.fromEntries(parsed.searchParams);
-
-                    // Handle common protocol commands from chat links
+                    const { command, segments, params } = target;
+                    // The commands chat links handle in-app (CHAT_PARACHORD_COMMANDS).
                     switch (command) {
                       case 'artist':
                         if (segments[0]) {
@@ -17767,14 +17756,12 @@ ${trackListXml}
                           performSearch(params.q);
                         }
                         break;
-                      default:
-                        console.log('Unhandled protocol command in chat link:', command);
                     }
                   } catch (err) {
                     console.error('Error handling protocol URL:', err);
                   }
                 } else {
-                  window.electron?.shell?.openExternal(url);
+                  window.electron?.shell?.openExternal(target.url);
                 }
               },
               style: { color: isUserMessage ? 'var(--playbar-accent-hover)' : 'var(--accent-soft)', textDecoration: 'underline', cursor: 'pointer' }
@@ -17960,11 +17947,11 @@ ${trackListXml}
           }, headerMatch[2])
         );
       }
-      // Check for card syntax: {{type|field1|field2|...}}
-      else if (/^\{\{(track|artist|album|playlist)\|(.+)\}\}$/.test(processedLine)) {
-        const cardMatch = processedLine.match(/^\{\{(track|artist|album|playlist)\|(.+)\}\}$/);
-        const cardType = cardMatch[1];
-        const cardParts = cardMatch[2].split('|');
+      // A line that is one card: {{type|field1|field2|...}}. A line with two
+      // cards (and text between) is not, and goes to parseInlineMarkdown
+      // below, which draws both (lib/chat-card-syntax.js, #1574).
+      else if (wholeLineCard(processedLine)) {
+        const { type: cardType, parts: cardParts } = wholeLineCard(processedLine);
         elements.push(renderCard(cardType, cardParts, `card-${keyCounter++}`));
         previousLineWasCard = true; // Mark so next line can strip leading punctuation
       }
@@ -32347,83 +32334,8 @@ Variety guidance: ${theme} Be creative and surprising — avoid defaulting to th
     // If cache has fewer than 4 covers, always try to get more - artist images may be
     // available from artistImageCache even if Spotify isn't currently connected
 
-    // Collect unique covers from tracks. Two uniqueness dimensions: the album
-    // (a distinct album deserves its own tile) and the cover URL (four
-    // tracks from four albums sharing one image — a playlist cover stamped on
-    // every track, or one art URL serving several album names — must not tile
-    // the same image four times).
-    const seenAlbums = new Set(); // Albums we've already tried
-    const seenCoverUrls = new Set(); // Cover URLs already in the grid
-    const seenArtists = new Set(); // Artists we've successfully used for images
-    const triedArtists = new Set(); // Artists we've attempted (including failures)
-    const covers = [];
-
-    // First pass: try album art, then artist image as fallback
-    for (const track of tracks) {
-      if (covers.length >= 4) break;
-
-      let foundCover = false;
-
-      // First try album art if we have album info
-      if (track.album && track.artist) {
-        const albumKey = `${track.artist}-${track.album}`.toLowerCase();
-        if (!seenAlbums.has(albumKey)) {
-          seenAlbums.add(albumKey);
-
-          // If track already has albumArt, use it
-          if (track.albumArt && !seenCoverUrls.has(track.albumArt)) {
-            seenCoverUrls.add(track.albumArt);
-            covers.push(track.albumArt);
-            seenArtists.add(track.artist.toLowerCase()); // Mark artist as used
-            foundCover = true;
-          } else if (!track.albumArt) {
-            // Try to fetch album art
-            const artUrl = await getAlbumArt(track.artist, track.album);
-            if (artUrl && !seenCoverUrls.has(artUrl)) {
-              seenCoverUrls.add(artUrl);
-              covers.push(artUrl);
-              seenArtists.add(track.artist.toLowerCase()); // Mark artist as used
-              foundCover = true;
-            }
-          }
-        }
-      }
-
-      // Fall back to artist image if no album art found for this track
-      if (!foundCover && track.artist) {
-        const artistKey = track.artist.toLowerCase();
-        if (!seenArtists.has(artistKey) && !triedArtists.has(artistKey)) {
-          triedArtists.add(artistKey);
-
-          const artistResult = await getArtistImage(track.artist);
-          if (artistResult?.url && !seenCoverUrls.has(artistResult.url)) {
-            seenCoverUrls.add(artistResult.url);
-            covers.push(artistResult.url);
-            seenArtists.add(artistKey);
-          }
-        }
-      }
-    }
-
-    // Second pass: if we still don't have 4 covers, try more artist images
-    if (covers.length < 4) {
-      for (const track of tracks) {
-        if (covers.length >= 4) break;
-        if (!track.artist) continue;
-
-        const artistKey = track.artist.toLowerCase();
-        // Skip if we already have art from this artist or already tried and failed
-        if (seenArtists.has(artistKey) || triedArtists.has(artistKey)) continue;
-
-        triedArtists.add(artistKey);
-        const artistResult = await getArtistImage(track.artist);
-        if (artistResult?.url && !seenCoverUrls.has(artistResult.url)) {
-          seenCoverUrls.add(artistResult.url);
-          covers.push(artistResult.url);
-          seenArtists.add(artistKey);
-        }
-      }
-    }
+    // Up to four covers from the tracks (lib/playlist-cover-picks.js).
+    const covers = await pickPlaylistCovers(tracks, { getAlbumArt, getArtistImage });
 
     // Cache the result
     if (covers.length > 0) {
@@ -35589,6 +35501,26 @@ useEffect(() => {
     });
   };
 
+  // "Playing from" a history mix opens the mix (#1592): the one on Home
+  // when it's still there (by link, or by the id a queue saved before the
+  // change carries), with its own line and cover; else, for a link, the
+  // same view built from the link alone, its service found through the
+  // plug-in registry; else Home, as before.
+  const openMixFromContext = (ctx) => {
+    const mix = mixForContext(homeMixes, ctx);
+    if (mix && mix.url) {
+      openServicePlaylist(mix, mix.resolverName);
+      return;
+    }
+    const url = ctx && typeof ctx.id === 'string' ? ctx.id : '';
+    if (/^https?:\/\//i.test(url)) {
+      const resolverId = resolverLoaderRef.current?.findResolverForUrl(url) || null;
+      openServicePlaylist({ id: url, url, name: ctx.name || 'Mix', resolverId }, resolverId ? pluginName(resolverId) : undefined);
+      return;
+    }
+    navigateTo('home');
+  };
+
   // Home's recommendations load: on a Home visit unless one is running, or a
   // full load finished within the last 10 minutes (shouldLoadHomeRecommendations
   // in lib/home-model.js; the time is recommendationsFullLoadAtRef, stamped
@@ -35738,15 +35670,13 @@ useEffect(() => {
     if (!concertsLocation) return [];
     const d = new Date();
     const today = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    const locCity = concertsLocation.toLowerCase().trim().split(',')[0].trim();
     const near = (event) => {
       const vLat = event.venue?.latitude, vLng = event.venue?.longitude;
       if (concertsLocationCoords && vLat != null && vLng != null) {
         return haversineDistance(concertsLocationCoords.lat, concertsLocationCoords.lng, vLat, vLng) <= concertsLocationRadius;
       }
-      const city = (event.venue?.city || '').toLowerCase().trim();
-      const region = (event.venue?.region || '').toLowerCase().trim();
-      return !!((city && locCity.includes(city)) || (region && locCity.includes(region)));
+      // By name: whole names only (lib/concert-events.js, #1568).
+      return venueMatchesLocationText(event.venue, concertsLocation);
     };
     return concerts
       .filter(event => event && typeof event.date === 'string' && event.date.slice(0, 10) >= today && near(event))
@@ -35822,7 +35752,7 @@ useEffect(() => {
   // Stable function props for the memo'd QueueDrawer (keys must
   // match QUEUE_DRAWER_HANDLERS in queue-drawer.js).
   const queueDrawerHandlers = useStableHandlers({
-    handleCollectionAlbumClick, handleDragEnter, handleDragLeave, handleDragOver, handleDrop, handlePlaylistDragEnd, handleSaveQueueAsPlaylist, loadPlaylist, navigateTo, openAiChat,
+    handleCollectionAlbumClick, handleDragEnter, handleDragLeave, handleDragOver, handleDrop, handlePlaylistDragEnd, handleSaveQueueAsPlaylist, loadPlaylist, navigateTo, openAiChat, openMixFromContext,
   });
 
   // Stable function props for the memo'd AddToPlaylistPanel (keys must
@@ -36159,11 +36089,19 @@ useEffect(() => {
     getTrackArt, navigateTo, startGettingStarted,
   });
 
+  // An artist's page on its On Tour tab: Home's concert cards (#1572), as
+  // the Concerts page's cards open it.
+  const openArtistOnTour = (artistName) => {
+    if (!artistName) return;
+    pendingProtocolTabRef.current = 'on-tour';
+    fetchArtistData(artistName);
+  };
+
   const homePageHandlers = useStableHandlers({
     addServicePlaylistToPlaylist, addToQueue, askShuffleupagus, connectPlugin, copyParachordLink, dismissHomeBanner, dismissHomeSetupItem,
     fetchAlbumTracksByName, getAlbumArt, handleAddWatchFolder, handleCollectionAlbumClick, handleStartCollectionStation,
     loadCharts, loadConcerts, loadCriticsPicks, loadNewReleases, loadPlaylist,
-    loadHomeHistoryMixes, loadHomeRecommendations, navigateTo, openChartsAlbum, openCriticsPicksAlbum, openHomeBannerCta, openPluginPanel, openServicePlaylist,
+    loadHomeHistoryMixes, loadHomeRecommendations, navigateTo, openArtistOnTour, openChartsAlbum, openCriticsPicksAlbum, openHomeBannerCta, openPluginPanel, openServicePlaylist,
     openTopAlbum, openWhatsNew, playServicePlaylist, playTrackCollection, prefetchTopAlbumTracks,
     queueServicePlaylist, showHomeContextMenu, skipGettingStarted, startGettingStarted,
   });
