@@ -729,17 +729,269 @@ describe('the plan gate (#1220) before any dmls request', () => {
     expect(resolver._planState.plan).toBe('unlimited');
   });
 
+  // Every plan but Music Unlimited plays only the account's bought tracks
+  // (#1494): a free account, or a tier Parachord can't read, like Prime.
   test.each([
-    ['PRIME', 'prime', /^Amazon Prime: Amazon is used for album art, artist photos and links\. Playing Amazon tracks in Parachord needs Music Unlimited\.$/],
-    [undefined, 'unknown', /couldn't confirm your Amazon Music plan/],
-    ['SOMETHING_NEW', 'unknown', /couldn't confirm your Amazon Music plan/]
-  ])('tier %p is refused as plan-ineligible before any dmls request', async (tier, planKey, message) => {
-    const { fetches } = mockWithConfig(configWithTier(tier));
+    [undefined, 'unknown'],
+    ['SOMETHING_NEW', 'unknown']
+  ])('tier %p plays a bought track and refuses the rest before any dmls request', async (tier, planKey) => {
+    const { amazonLibraryPage, serveAmazonLibrary } = require('../helpers/amazon-plugin-bridge');
+    const { ws, fetches } = mockWithConfig(configWithTier(tier));
+    serveAmazonLibrary(ws, { first: amazonLibraryPage([{ asin: 'B0OWNED001', title: 'Bought', artist: 'A' }]) });
     const resolver = instantiateAmazonPlugin(axe);
     const err = await resolver.getPlaybackManifest(drmTrack(), {}).catch((e) => e);
     expect(err).toMatchObject({ reason: 'plan-ineligible', planKey });
-    expect(err.message).toMatch(message);
+    expect(err.message).toBe("Parachord plays the songs you've bought from Amazon. Playing anything else from Amazon needs Music Unlimited, which Parachord couldn't find on your account.");
     expect(manifestPosts(fetches)).toHaveLength(0);
+    await expect(resolver.getPlaybackManifest(drmTrack('B0OWNED001'), {})).resolves.toMatchObject({ manifest: expect.any(String) });
+    expect(manifestPosts(fetches)).toHaveLength(1);
+  });
+
+  // Prime plays the tracks the account bought (#1494), checked against the
+  // plugin's own list from the library page, never a flag on the track.
+  describe('on Prime', () => {
+    const { amazonLibraryPage, serveAmazonLibrary } = require('../helpers/amazon-plugin-bridge');
+    const primeWithLibrary = (pages) => {
+      const mock = mockWithConfig(configWithTier('PRIME'));
+      serveAmazonLibrary(mock.ws, pages || {
+        first: amazonLibraryPage([
+          { asin: 'B0OWNED001', title: 'Bought', artist: 'A' },
+          { asin: 'B0LIKED001', title: 'Liked', artist: 'A', bought: false }
+        ])
+      });
+      return mock;
+    };
+
+    test('a bought track plays', async () => {
+      const { fetches } = primeWithLibrary();
+      const resolver = instantiateAmazonPlugin(axe);
+      await expect(resolver.getPlaybackManifest(drmTrack('B0OWNED001'), {})).resolves.toMatchObject({ manifest: expect.any(String) });
+      expect(manifestPosts(fetches)).toHaveLength(1);
+    });
+
+    test('a track the account only liked, or never bought, is refused before any dmls request', async () => {
+      const { fetches } = primeWithLibrary();
+      const resolver = instantiateAmazonPlugin(axe);
+      for (const asin of ['B0LIKED001', 'B0NEVER001']) {
+        const err = await resolver.getPlaybackManifest(drmTrack(asin), {}).catch((e) => e);
+        expect(err).toMatchObject({ reason: 'plan-ineligible', planKey: 'prime' });
+        expect(err.message).toBe("Amazon Prime: Parachord plays the songs you've bought from Amazon. Playing anything else from Amazon needs Music Unlimited.");
+      }
+      expect(manifestPosts(fetches)).toHaveLength(0);
+    });
+
+    test('a flag on the track is not proof of a purchase', async () => {
+      const { fetches } = primeWithLibrary();
+      const resolver = instantiateAmazonPlugin(axe);
+      const track = { ...drmTrack('B0NEVER001'), amazonPurchased: true, owned: true };
+      await expect(resolver.getPlaybackManifest(track, {})).rejects.toMatchObject({ reason: 'plan-ineligible' });
+      expect(manifestPosts(fetches)).toHaveLength(0);
+    });
+
+    test('a library that cannot be read is "try again", not a plan refusal', async () => {
+      const mock = mockWithConfig(configWithTier('PRIME'));
+      serveAmazonLibrary(mock.ws, {}, { capture: null });
+      const resolver = instantiateAmazonPlugin(axe);
+      const err = await resolver.getPlaybackManifest(drmTrack('B0OWNED001'), {}).catch((e) => e);
+      expect(err).toMatchObject({ reason: 'not-ready' });
+      expect(err.message).toBe("Couldn't read your Amazon purchases. Try again in a minute.");
+      expect(manifestPosts(mock.fetches)).toHaveLength(0);
+    });
+  });
+});
+
+// ── the first play on Prime (#1603) ────────────────────────────────────────
+
+// The purchases read holds the page-flow queue for a page load and its
+// replays; a csrf mint behind it used to load another page (the songs
+// search), and together they missed the engine's 10 s manifest budget on the
+// first play after launch. The read now keeps the csrf triplet its own page
+// sent, and a mint right after it uses that instead of a second page load.
+describe('the first play on Prime (#1603)', () => {
+  const { amazonLibraryCapture, amazonLibraryPage, serveAmazonLibrary } = require('../helpers/amazon-plugin-bridge');
+  const PRIME_CONFIG = { ...CONFIG_JSON, tier: 'PRIME' };
+  const ownedPage = () => ({ first: amazonLibraryPage([{ asin: 'B0OWNED001', title: 'Bought', artist: 'A' }]) });
+  // The purchases page's own gql request, with a live-looking csrf triplet.
+  const liveLibraryCapture = () => {
+    const capture = amazonLibraryCapture();
+    return { ...capture, headers: { ...capture.headers, ...MINT_HEADERS_FRESH } };
+  };
+  const primeMock = (opts = {}) => {
+    const mock = drmMock({ configJson: PRIME_CONFIG, ...opts });
+    serveAmazonLibrary(mock.ws, ownedPage(), { capture: liveLibraryCapture() });
+    return mock;
+  };
+  // Every page load, the purchases page included (serveAmazonLibrary answers
+  // that one itself).
+  const pageLoads = (ws) => ws.load.mock.calls.map((c) => c[1]);
+
+  test('a play reads the purchases first and mints from that page\'s headers: one page load, not two', async () => {
+    const { ws, fetches } = primeMock();
+    const resolver = instantiateAmazonPlugin(axe);
+    await expect(resolver.getPlaybackManifest(drmTrack('B0OWNED001'), {})).resolves.toMatchObject({ manifest: expect.any(String) });
+    expect(pageLoads(ws)).toEqual(['https://music.amazon.com/my/purchases']);
+    expect(manifestPosts(fetches)[0].headers['csrf-token']).toBe(MINT_HEADERS_FRESH['csrf-token']);
+    expect(manifestPosts(fetches)[0].headers['csrf-ts']).toBe(MINT_HEADERS_FRESH['csrf-ts']);
+    // The plan read's config.json serves the mint too (read seconds apart).
+    expect(configFetches(fetches)).toHaveLength(1);
+  });
+
+  test('a play while the launch-time purchases read is running joins it and needs no page of its own', async () => {
+    const mock = primeMock();
+    let releaseLibrary;
+    const libraryLoaded = new Promise((resolve) => { releaseLibrary = resolve; });
+    const served = mock.ws.load.getMockImplementation();
+    mock.ws.load.mockImplementation(async (id, url, o) => {
+      if (String(url).endsWith('/my/purchases')) await libraryLoaded;
+      return served(id, url, o);
+    });
+    const resolver = instantiateAmazonPlugin(axe);
+    const startupRead = resolver.getOwnedTracks(); // getStatus's prefetch
+    await flush();
+    const play = resolver.getPlaybackManifest(drmTrack('B0OWNED001'), {});
+    await flush();
+    releaseLibrary();
+    await expect(play).resolves.toMatchObject({ manifest: expect.any(String) });
+    await startupRead;
+    expect(pageLoads(mock.ws)).toEqual(['https://music.amazon.com/my/purchases']);
+  });
+
+  test('placeholder csrf values on the purchases page are not kept: the mint loads its page', async () => {
+    const mock = drmMock({ configJson: PRIME_CONFIG });
+    serveAmazonLibrary(mock.ws, ownedPage()); // the fixture's 't'/'r' placeholders
+    const resolver = instantiateAmazonPlugin(axe);
+    await resolver.getPlaybackManifest(drmTrack('B0OWNED001'), {});
+    expect(pageLoads(mock.ws)).toEqual(['https://music.amazon.com/my/purchases', 'https://music.amazon.com/search/the/songs']);
+    expect(manifestPosts(mock.fetches)[0].headers['csrf-token']).toBe(MINT_HEADERS['csrf-token']);
+  });
+
+  test('kept headers older than the reuse window are not used', async () => {
+    const mock = primeMock();
+    const resolver = instantiateAmazonPlugin(axe);
+    const lib = resolver.requireLib();
+    await resolver.getOwnedTracks();
+    resolver._csrfHarvest.at -= lib.CSRF_HARVEST_MAX_AGE_MS + 1;
+    await resolver.getPlaybackManifest(drmTrack('B0OWNED001'), {});
+    expect(pageLoads(mock.ws)).toEqual(['https://music.amazon.com/my/purchases', 'https://music.amazon.com/search/the/songs']);
+  });
+
+  test('a sign-out drops the kept headers with the rest of the session', async () => {
+    primeMock({ generation: 0 });
+    const resolver = instantiateAmazonPlugin(axe);
+    await resolver.sessionState();
+    await resolver.getOwnedTracks();
+    expect(resolver._csrfHarvest).toBeTruthy();
+    primeMock({ generation: 1 });
+    await resolver.sessionState();
+    expect(resolver._csrfHarvest).toBeNull();
+  });
+
+  test('a session the dmls refused re-mints from a page load, never from the kept headers', async () => {
+    const authRefusal = { status: 400, text: '{"message":"REQUIRED_COOKIES_MISSING"}' };
+    const mock = primeMock({
+      dmls: [authRefusal, { status: 200, text: JSON.stringify({ contentResponseList: [manifestReply()] }) }, { status: 200, text: '{"license":"Q0VSVF9PSw=="}' }]
+    });
+    const resolver = instantiateAmazonPlugin(axe);
+    await expect(resolver.getPlaybackManifest(drmTrack('B0OWNED001'), {})).resolves.toMatchObject({ manifest: expect.any(String) });
+    expect(pageLoads(mock.ws)).toEqual(['https://music.amazon.com/my/purchases', 'https://music.amazon.com/search/the/songs']);
+    const posts = manifestPosts(mock.fetches);
+    expect(posts[0].headers['csrf-token']).toBe(MINT_HEADERS_FRESH['csrf-token']);
+    expect(posts[1].headers['csrf-token']).toBe(MINT_HEADERS['csrf-token']);
+  });
+
+  test('Music Unlimited still mints from one page load and one config.json read', async () => {
+    const { ws, fetches } = drmMock();
+    const resolver = instantiateAmazonPlugin(axe);
+    await resolver.getPlaybackManifest(drmTrack(), {});
+    expect(pageLoads(ws)).toEqual(['https://music.amazon.com/search/the/songs']);
+    expect(configFetches(fetches)).toHaveLength(1);
+  });
+});
+
+// ── a purchase's plain stream (#1612) ────────────────────────────────────────
+
+// Amazon's own web player streams a purchase from the library locker
+// (getStreamingURLs by the purchased copy's COID) as a progressive MP3, with
+// no DRM. getStreamUrl asks for it, only for a track on the plug-in's own
+// purchases list.
+describe('getStreamUrl: a purchase from the library locker (#1612)', () => {
+  const { amazonLibraryPage, serveAmazonLibrary } = require('../helpers/amazon-plugin-bridge');
+  const STREAM = 'https://d1.cloudfront.net/obj?response-content-disposition=filename%3D%2205%20-%20Song.mp3%22&coid=b0owned001&Expires=1&Signature=s&Key-Pair-Id=k';
+  const lockerReply = (over = {}) => ({
+    contentResponseList: [{
+      contentID: { identifier: 'b0owned001', identifierType: 'COID' },
+      protocol: 'PROGRESSIVE', statusCode: 'SUCCESS', cdnTypeList: ['cf'], assetQualities: [],
+      expiration: 1795000000, urlList: [STREAM], ...over
+    }],
+    statusCode: 'SUCCESS'
+  });
+  const lockerMock = (dmls, tier = 'PRIME') => {
+    const mock = drmMock({ configJson: { ...CONFIG_JSON, tier }, dmls });
+    serveAmazonLibrary(mock.ws, { first: amazonLibraryPage([{ asin: 'B0OWNED001', title: 'Bought', artist: 'A' }]) });
+    return mock;
+  };
+  const lockerPosts = (fetches) => dmlsFetches(fetches).filter((r) => String(r.headers['X-Amz-Target'] || '').endsWith('.getStreamingURLs'));
+
+  test('a bought track: one getStreamingURLs request by its COID, answering the signed URL', async () => {
+    const { fetches } = lockerMock([{ status: 200, text: JSON.stringify(lockerReply()) }]);
+    const resolver = instantiateAmazonPlugin(axe);
+    await expect(resolver.getStreamUrl(drmTrack('B0OWNED001'), {})).resolves.toBe(STREAM);
+    const posts = lockerPosts(fetches);
+    expect(posts).toHaveLength(1);
+    expect(posts[0].url).toBe('https://music.amazon.com/NA/api/dmls/');
+    expect(posts[0].headers['X-Amz-Target']).toBe('com.amazon.digitalmusiclocator.DigitalMusicLocatorServiceExternal.getStreamingURLs');
+    expect(posts[0].headers['csrf-token']).toBe(MINT_HEADERS['csrf-token']);
+    const body = JSON.parse(posts[0].body);
+    expect(body).toMatchObject({
+      contentIdList: [{ identifier: 'b0owned001', identifierType: 'COID' }],
+      bitRate: 'HIGH',
+      deviceToken: { deviceTypeId: 'A16ZV8BU3SN1N3', deviceId: '12345678901234567' },
+      appMetadata: { https: true, appId: 'GreenHornet_Web' },
+      clientMetadata: { clientId: 'WebCP' },
+      customerId: 'CUST1'
+    });
+    expect(typeof body.clientMetadata.clientRequestId).toBe('string');
+    expect(body.clientMetadata.clientRequestId.length).toBeGreaterThan(8);
+    // No manifest request: this path has no DRM.
+    expect(manifestPosts(fetches)).toHaveLength(0);
+  });
+
+  test('on Music Unlimited a purchase streams the same way', async () => {
+    lockerMock([{ status: 200, text: JSON.stringify(lockerReply()) }], 'UNLIMITED_HD');
+    await expect(instantiateAmazonPlugin(axe).getStreamUrl(drmTrack('B0OWNED001'), {})).resolves.toBe(STREAM);
+  });
+
+  test('a track the account doesn\'t own has no plain stream: null, no request, whatever the track says', async () => {
+    const { fetches } = lockerMock([]);
+    const resolver = instantiateAmazonPlugin(axe);
+    await expect(resolver.getStreamUrl(drmTrack('B0NEVER001'), {})).resolves.toBeNull();
+    await expect(resolver.getStreamUrl({ ...drmTrack('B0NEVER001'), amazonCoid: 'forged', owned: true }, {})).resolves.toBeNull();
+    expect(lockerPosts(fetches)).toHaveLength(0);
+  });
+
+  test('a refusal or an answer with no https URL is load-failed, never a URL', async () => {
+    for (const reply of [
+      { status: 500, text: 'oops' },
+      { status: 200, text: 'not json' },
+      { status: 200, text: JSON.stringify(lockerReply({ statusCode: 'CONTENT_NOT_FOUND', urlList: [] })) },
+      { status: 200, text: JSON.stringify(lockerReply({ urlList: ['http://insecure.example/x.mp3'] })) },
+    ]) {
+      lockerMock([reply]);
+      await expect(instantiateAmazonPlugin(axe).getStreamUrl(drmTrack('B0OWNED001'), {})).rejects.toMatchObject({ reason: 'load-failed' });
+    }
+  });
+
+  test('signed out: not-signed-in, no request', async () => {
+    const mock = drmMock({ signedIn: false });
+    const resolver = instantiateAmazonPlugin(axe);
+    await expect(resolver.getStreamUrl(drmTrack('B0OWNED001'), {})).rejects.toMatchObject({ reason: 'not-signed-in' });
+    expect(lockerPosts(mock.fetches)).toHaveLength(0);
+  });
+
+  test('purchases that can\'t be read are "try again", not null', async () => {
+    const mock = drmMock({ configJson: { ...CONFIG_JSON, tier: 'PRIME' } });
+    serveAmazonLibrary(mock.ws, {}, { capture: null });
+    await expect(instantiateAmazonPlugin(axe).getStreamUrl(drmTrack('B0OWNED001'), {})).rejects.toMatchObject({ reason: 'not-ready' });
   });
 });
 

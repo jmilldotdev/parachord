@@ -1425,7 +1425,7 @@ const { contextPlaylistTarget, playlistRef } = require('./lib/playlist-context')
 const { pulledOpenPlaylist } = require('./lib/playlist-sync-banner');
 const { SERVICE_REFRESH_MS, playlistUpdateMode, isPolledHostedXspf, serviceRefreshDue, hostedListForMode } = require('./lib/playlist-update-mode');
 const { refreshedTracks } = require('./lib/hosted-refresh');
-const { shouldPushToSource, recordPushToSource } = require('../../sync-engine/auto-pull');
+const { shouldPushToSource, recordPushToSource, tracksFingerprint } = require('../../sync-engine/auto-pull');
 const { Play, Pause, SkipForward, SkipBack, Volume2, Search, List, Settings, Plus, Music, Radio, Users, Heart, X } = Icons;
 
 
@@ -2074,7 +2074,7 @@ const { useLocalFiles } = require('./hooks/use-local-files');
 // The Collection with local files merged in (#1532): one song list, one
 // album list, every source on each entry.
 // When resolveTrack's local-file gate applies: everything not on screen (#1532).
-const { isOnScreenResolution, skipsLocalFill } = require('./lib/enrichment-gate');
+const { isOnScreenResolution, skipsLocalFill, needsPlayFill, mergeFoundSources } = require('./lib/enrichment-gate');
 const { albumIdentity, mergeCollectionSongs, deriveLocalAlbums, mergeCollectionAlbums, deriveLocalArtists, mergeCollectionArtists, hideLocalAlbum, unhideLocalAlbum, planAlbumRemoval, savedAlbumIdsFor, findSavedAlbumCopy } = require('./lib/local-albums');
 const { HomePage } = require('./components/home-page');
 const { PlaylistViewPage, PlaylistViewLoading } = require('./components/playlist-view-page');
@@ -2098,6 +2098,7 @@ const { PROVIDER_LABEL, getPlaylistMirrorTargets } = require('./lib/playlist-mir
 // A playlist's own cover in XSPF (#1410): read from a document's playlist-level
 // <image> only when it's a public http(s) URL, and written back out on export.
 const { playlistImageUrl, playlistImageXml, withPlaylistImage } = require('./lib/xspf-image');
+const { storedXspfFor } = require('./lib/stored-xspf');
 const { playlistImportLabel } = require('./lib/playlist-import-sources');
 const { FirstRunTutorial } = require('./components/first-run-tutorial');
 const { StopSyncDialog } = require('./components/stop-sync-dialog');
@@ -2760,6 +2761,7 @@ PLAYING ALBUMS vs TRACKS:
   Example: To play "Punisher" album, queue_add all 11 tracks in order.
 - If user says "add album to queue": use queue_add with ALL tracks and position "last" - does NOT interrupt current playback
 - NEVER use play + queue_add together for multi-track requests — that causes the first song to play twice
+- HOW MANY TRACKS: A mix, playlist or "some songs" with no number given gets 10 tracks. If the user names a number, use exactly that number. An album gets all of its tracks.
 - NEVER say "the album will continue playing" - you must explicitly queue each track
 
 PERSONALIZATION - CRITICAL:
@@ -8053,14 +8055,22 @@ const Parachord = () => {
   // fresh timestamp. cacheValid then treats every enabled resolver as already
   // queried for 7 days. Zero those timestamps too, not only entries that
   // carry the marker.
-  const clearResolverMisses = (resolverId) => {
+  //
+  // `sources: true` drops the resolver's FOUND sources too, not only its
+  // misses: on entering a plan that plays only owned tracks (Amazon on Prime,
+  // #1494, playback-limits.js limitTransition's purge), a source found on
+  // another plan may be a track the account doesn't own. The queue and an
+  // open playlist keep theirs until they resolve again; playing one the
+  // plan refuses plays another source (the engine's plan refusal).
+  const clearResolverMisses = (resolverId, { sources: dropFound = false } = {}) => {
+    const gone = (value) => !!value && (dropFound || !!value.noMatch);
     const cache = trackSourcesCache.current || {};
     for (const key of Object.keys(cache)) {
       const entry = cache[key];
       if (!entry?.sources) continue;
       const am = entry.sources[resolverId];
-      if (am && !am.noMatch) continue;
-      if (am?.noMatch) {
+      if (am && !gone(am)) continue;
+      if (gone(am)) {
         const sources = { ...entry.sources };
         delete sources[resolverId];
         entry.sources = sources;
@@ -8076,7 +8086,7 @@ const Parachord = () => {
       let changed = false;
       const next = { ...prev };
       for (const key of Object.keys(next)) {
-        if (!next[key]?.[resolverId]?.noMatch) continue;
+        if (!gone(next[key]?.[resolverId])) continue;
         const copy = { ...next[key] };
         delete copy[resolverId];
         if (copy.__noMatchAll) delete copy.__noMatchAll;
@@ -8089,7 +8099,7 @@ const Parachord = () => {
       if (!prev?.tracks?.length) return prev;
       let changed = false;
       const tracks = prev.tracks.map(t => {
-        if (!t?.sources?.[resolverId]?.noMatch) return t;
+        if (!gone(t?.sources?.[resolverId])) return t;
         changed = true;
         const sources = { ...t.sources };
         delete sources[resolverId];
@@ -8112,8 +8122,13 @@ const Parachord = () => {
       const key = PlaybackLimits.limitStorageKey(resolverId);
       let last = null;
       try { last = localStorage.getItem(key); } catch (e) {}
-      const { reresolve, store } = PlaybackLimits.limitTransition(last, limit);
-      if (reresolve) {
+      const { reresolve, purge, store } = PlaybackLimits.limitTransition(last, limit);
+      if (purge) {
+        // A plan that plays only owned tracks (#1494): sources found before
+        // may not be owned, so they go, and the resolver searches again.
+        console.log(`[Playback limits] ${resolverId} plays only owned tracks (${limit.planKey}); dropping its saved sources and searching again`);
+        clearResolverMisses(resolverId, { sources: true });
+      } else if (reresolve) {
         console.log(`[Playback limits] ${resolverId} can play now (${limit.planKey}); searching it again`);
         clearResolverMisses(resolverId);
       }
@@ -9262,6 +9277,35 @@ const Parachord = () => {
       if (intervalId) clearInterval(intervalId);
     };
   }, [cacheLoaded]);
+
+  // A track that starts playing with a local file as its only playable source
+  // fills its other sources once (needsPlayFill, lib/enrichment-gate.js).
+  // Played from somewhere not on screen (the queue, Collection Radio, a link,
+  // listen-along), it only ever met the gated resolutions above, so its other
+  // services were never asked and the playbar's "Play from" picker, which
+  // lists only the playing track's own sources, had nothing to offer. One
+  // fill per track per session (enrichmentAttemptedRef, shared with the
+  // trickle); the gate still holds for every bulk and background pass. What
+  // it finds joins the playing track (mergeFoundSources), never replacing a
+  // source it has; resolveTrack also writes it to trackSources and the cache.
+  const playingTrackId = currentTrack?.id || null;
+  useEffect(() => {
+    const track = currentTrack;
+    if (!track || !track.id || track.id !== playingTrackId) return;
+    if (enrichmentAttemptedRef.current.has(track.id)) return;
+    if (!needsPlayFill(track, { isLocal: isLocalResolver, isPlayable: isPlayableSource })) return;
+    enrichmentAttemptedRef.current.add(track.id);
+    resolveTrack(track, track.artist || track.artistName || 'Unknown Artist', { forceEnrichment: true })
+      .then((found) => {
+        if (!found || typeof found !== 'object') return;
+        setCurrentTrack(prev => {
+          if (!prev || prev.id !== track.id) return prev;
+          const merged = mergeFoundSources(prev.sources, found);
+          return Object.keys(merged).length === Object.keys(prev.sources || {}).length ? prev : { ...prev, sources: merged };
+        });
+      })
+      .catch((err) => console.warn('[Play fill] Could not look for other sources:', err?.message || err));
+  }, [playingTrackId]);
 
   // Fire-and-forget telemetry recorder. Best-effort — failures are
   // logged in main and never propagate to UI state.
@@ -12860,10 +12904,13 @@ ${trackListXml}
       }
     };
 
-    // Apple Music session error (e.g. error 6: TOS not accepted, Music daemon not running)
-    // Show a one-time toast guiding the user to open Music.app
+    // Apple Music session error (error 6: the Mac's player isn't ready, as
+    // after a macOS update until the Music app has run once, or terms not
+    // accepted). The plug-in falls back to MusicKit JS, so the track still
+    // plays: say that, and what fixes it. Once a session (the plug-in sends
+    // the event once).
     const handleAppleMusicSessionError = () => {
-      showToast('Apple Music can\'t play right now. Open the Music app to accept any pending terms or sign in, then try again.', 'error');
+      showToast('Apple Music is playing through its web player because this Mac’s player isn’t ready. Open the Music app once to fix it.', 'info', null, { duration: 10000 });
     };
 
     window.addEventListener('musickit-track-ended', handleMusicKitTrackEnded);
@@ -20195,6 +20242,7 @@ ${trackListXml}
             listenbrainzId: jam.id,
             title: jam.title,
             weekLabel: jam.weekLabel,
+            date: jam.date || null,
             description: jam.description,
             tracks: jam.tracks || [],
             tracksLoaded: jam.tracksLoaded,
@@ -32394,9 +32442,12 @@ Variety guidance: ${theme} Be creative and surprising — avoid defaulting to th
     }
     console.log(`📋 Loading playlist: ${playlist.title}`);
 
-    // Parse XSPF if we have the content
-    if (playlist.xspf) {
-      const parsed = parseXSPF(playlist.xspf);
+    // Parse the saved XSPF text while it still lists the playlist's tracks;
+    // after a sync pull it doesn't, and `tracks` (the branch below) is the
+    // playlist (lib/stored-xspf.js).
+    const storedXspf = storedXspfFor(playlist, parseXSPF);
+    if (storedXspf) {
+      const parsed = parseXSPF(storedXspf);
       if (parsed) {
         console.log(`🎵 Parsed ${parsed.tracks.length} tracks from XSPF`);
 
@@ -33315,6 +33366,10 @@ Variety guidance: ${theme} Be creative and surprising — avoid defaulting to th
             creator: playlistCreator,
             ...(playlistCover ? { coverArt: playlistCover } : {}),
             tracks: refreshed.tracks,
+            // The link's own tracklist, on every poll: the sync banner reads
+            // tracks that match it as the link's change, not yours
+            // (lib/playlist-sync-banner.js).
+            linkTracksFingerprint: tracksFingerprint(parsed.tracks || []),
             lastUpdated: Date.now(),
             ...(contentChanged ? { locallyModified: true, lastModified: Date.now() } : {})
           }, Date.now());
@@ -33729,7 +33784,9 @@ Variety guidance: ${theme} Be creative and surprising — avoid defaulting to th
   // menu ("Export as XSPF…") and the queue save dialog ("Save to file")
   // (parachord#1010; the handler and IPC existed with no caller). Playlists
   // created in-app (queue-*, ai-chat-*, playlist-*) carry no `xspf` field, so
-  // the document is generated from `tracks` when it is missing.
+  // the document is generated from `tracks` when it is missing, and also
+  // when it no longer lists them (a sync pull changes `tracks` only;
+  // lib/stored-xspf.js).
   const handleExportPlaylist = async (playlist) => {
     try {
       console.log(`📤 Exporting playlist: ${playlist.id}`);
@@ -33741,7 +33798,7 @@ Variety guidance: ${theme} Be creative and surprising — avoid defaulting to th
       }
       // Every exported playlist carries its cover (#1410): a stored document
       // that doesn't name one gets the record's coverArt added.
-      const content = withPlaylistImage(playlist.xspf || generateXSPF({
+      const content = withPlaylistImage(storedXspfFor(playlist, parseXSPF) || generateXSPF({
         title: playlist.title || playlist.name || 'Playlist',
         creator: playlist.creator,
         createdAt: playlist.createdAt,
@@ -35847,8 +35904,27 @@ useEffect(() => {
 
   // Stable function props for the memo'd PluginSettingsDialog (keys must
   // match PLUGIN_SETTINGS_DIALOG_HANDLERS in plugin-settings-dialog.js).
+  // A plug-in dialog's "Playback quality" line opens the global setting
+  // (#1608): close the dialog, then Settings › General at that section.
+  const openPlaybackQualitySettings = () => {
+    setSelectedResolver(null);
+    setActiveView('settings');
+    setSettingsTab('general');
+    setTimeout(() => {
+      const section = document.getElementById('playback-quality-settings');
+      if (section) section.scrollIntoView({ block: 'start' });
+    }, 0);
+  };
+  // What the app plays a plug-in with, for its "Playback quality" line and
+  // the Playback Quality section (lib/playback-quality-line.js, #1608):
+  // hostPlayback[pluginId].nativeApp is the service's own app playing it
+  // (Apple Music through the macOS helper, which follows the Music app's
+  // quality setting rather than Parachord's), keyed like hostAccounts.
+  const hostPlayback = useMemo(() => ({
+    applemusic: { nativeApp: appleMusicNativeAvailable },
+  }), [appleMusicNativeAvailable]);
   const pluginSettingsDialogHandlers = useStableHandlers({
-    clearMetaServiceConfig, fetchDynamicModels, getServiceColor, handleAddWatchFolder, handleInstallFromMarketplace, handleRemoveMissingFiles, handleRemoveWatchFolder, handleRescanAll, handleRescanFolder, handleUninstallResolver, manageAmazonMusic, openSyncSetupModal, refreshPluginStatus, saveMetaServiceConfig, setProviderSyncEnabled, setResolverMetadataOn, setResolverPlaybackOn, setResolverRecommendationsOn, showConfirmDialog, toggleResolver,
+    clearMetaServiceConfig, fetchDynamicModels, getServiceColor, handleAddWatchFolder, handleInstallFromMarketplace, handleRemoveMissingFiles, handleRemoveWatchFolder, handleRescanAll, handleRescanFolder, handleUninstallResolver, manageAmazonMusic, openPlaybackQualitySettings, openSyncSetupModal, refreshPluginStatus, saveMetaServiceConfig, setProviderSyncEnabled, setResolverMetadataOn, setResolverPlaybackOn, setResolverRecommendationsOn, showConfirmDialog, toggleResolver,
   });
 
   // The accounts the app itself signs in to, for the plug-in settings
@@ -36614,6 +36690,8 @@ useEffect(() => {
           homeSuggestionsAutoRefresh,
           homeSuggestionsAutoRefreshRef,
           installingResolvers,
+          hostPlayback,
+          pluginAccounts,
           loadedResolvers,
           marketplaceCategory,
           marketplaceError,
@@ -36834,6 +36912,8 @@ useEffect(() => {
       currentTrackRef,
       dynamicModelOptions,
       hostAccounts,
+      hostPlayback,
+      pluginAccounts,
       installingResolvers,
       isScanning,
       localFilesStats,
@@ -36847,6 +36927,9 @@ useEffect(() => {
       metaServiceConfigs,
       metaServices,
       playbackLimits,
+      playbackAbr,
+      playbackQuality,
+      playbackSpatial,
       pluginStatuses,
       playbackOffResolvers,
       recommendationsOffResolvers,

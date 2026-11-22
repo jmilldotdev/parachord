@@ -18,6 +18,7 @@
 // from props under their old names.
 
 const Icons = require('./icons');
+const { weeklySavedName } = require('../lib/weekly-saved-name');
 const { StickyBar } = require('./filter-box');
 const { useReveal, ArtOverlay } = require('./card-art');
 const { Badge } = require('./badge');
@@ -35,7 +36,7 @@ const { trackSlug } = require('../lib/track-slug');
 const { countOf } = require('../lib/plural');
 const { pluginName, importSourcePluginId } = require('../lib/plugin-names');
 const { syncBannerState } = require('../lib/playlist-sync-banner');
-const { tracksFingerprint } = require('../../../sync-engine/auto-pull');
+const { tracksFingerprint, refreshFromSource } = require('../../../sync-engine/auto-pull');
 
 // Column widths that follow the content area (#1389). At the 1000px minimum
 // window the content is 744px: a fixed 240px art column and 140px of source
@@ -296,7 +297,9 @@ const PlaylistViewPage = React.memo(function PlaylistViewPage(props) {
                   const newPlaylist = {
                     ...selectedPlaylist,
                     id: `playlist-${Date.now()}`,
-                    title: selectedPlaylist.weekLabel ? `Weekly Jam - ${selectedPlaylist.weekLabel}` : selectedPlaylist.title,
+                    // Its kind and its week's date, never the relative week
+                    // label, so each week's copy has its own name (#1599).
+                    title: selectedPlaylist.weekLabel ? weeklySavedName(selectedPlaylist) : selectedPlaylist.title,
                     creator: selectedPlaylist.creator || 'ListenBrainz',
                     tracks: playlistTracks,
                     addedAt: Date.now(),
@@ -304,6 +307,7 @@ const PlaylistViewPage = React.memo(function PlaylistViewPage(props) {
                     source: selectedPlaylist.source || 'listenbrainz'
                   };
                   delete newPlaylist.isEphemeral;
+                  delete newPlaylist.weekLabel;
                   setPlaylists(prev => [...prev, newPlaylist]);
                   await savePlaylistToStore(newPlaylist);
                   showToast('Playlist saved to library', 'success');
@@ -347,6 +351,65 @@ const PlaylistViewPage = React.memo(function PlaylistViewPage(props) {
                     refreshing ? 'Updating…' : (on ? 'Auto-update · On' : 'Auto-update · Off'),
                     React.createElement(Icons.ChevronDown, { className: 'w-4 h-4', style: { marginLeft: '4px' } })),
                 });
+              })(),
+              // Refresh a playlist imported from a service now, without
+              // waiting for the next full sync (a playlist another app
+              // rebuilds, such as a SmarterPlaylists Daily Brew, or a followed one). The background sync's own rules
+              // (sync-engine/auto-pull.js refreshFromSource): the service's
+              // tracks come in unless you edited it here and it changed there
+              // too, which is a conflict the banner below asks about. A
+              // playlist imported from a link has its own Refresh now under
+              // Auto-update; a hosted XSPF's link is its upstream.
+              (() => {
+                const playlist = selectedPlaylist;
+                if (!playlist || playlist.isEphemeral || playlistEditMode || playlist.sourceUrl) return null;
+                const from = playlist.syncedFrom;
+                if (!from || !from.resolver || !from.externalId) return null;
+                const id = playlist.id;
+                const refreshing = refreshingPlaylist === id;
+                const serviceName = pluginName(from.resolver);
+                const refresh = async () => {
+                  if (refreshingPlaylist === id) return;
+                  setRefreshingPlaylist(id);
+                  try {
+                    const fetched = await window.electron.sync.fetchPlaylistTracks(from.resolver, from.externalId);
+                    if (!fetched || !fetched.success || !Array.isArray(fetched.tracks)) {
+                      console.error('Refresh: fetching the playlist failed:', fetched && fetched.error);
+                      showToast(fetched && fetched.errorCode === 'missing_scopes'
+                        ? `Parachord needs more access to ${serviceName}. Sign out and in again in Settings › Plug-Ins.`
+                        : `Couldn’t refresh from ${serviceName}. Try again.`, 'error');
+                      return;
+                    }
+                    const result = refreshFromSource(playlist, fetched, { now: Date.now() });
+                    // What came back, for the diagnostic log: a "nothing new"
+                    // that isn't is either the service's own answer or ours.
+                    console.log(`🔄 Refresh "${playlist.title}" from ${from.resolver}: ${fetched.tracks.length} fetched, ${(playlist.tracks || []).length} here, same tracks: ${tracksFingerprint(fetched.tracks) === tracksFingerprint(playlist.tracks || [])}, unchanged since last sync: ${tracksFingerprint(fetched.tracks) === from.tracksFingerprint}, snapshot ${fetched.snapshotId && fetched.snapshotId === from.snapshotId ? 'same' : 'new'} → ${result.outcome}`);
+                    if (result.playlist) {
+                      const next = result.playlist;
+                      setPlaylists(prev => prev.map(p => p.id === id ? next : p));
+                      setSelectedPlaylist(prev => (prev && prev.id === id ? next : prev));
+                      if (result.outcome === 'pulled') setPlaylistTracks(next.tracks);
+                      await savePlaylistToStore(next);
+                    }
+                    showToast(result.outcome === 'pulled'
+                      ? `Updated from ${serviceName}: ${countOf(result.playlist.tracks.length, 'track')}`
+                      : result.outcome === 'conflict'
+                      ? `This playlist changed on ${serviceName} and here. Choose which to keep above.`
+                      : result.outcome === 'empty'
+                      ? `${serviceName} sent no tracks for this playlist, so it’s left as it is.`
+                      : `Already up to date with ${serviceName}`);
+                  } catch (err) {
+                    console.error('Refresh from service failed:', err);
+                    showToast(`Couldn’t refresh from ${serviceName}. Try again.`, 'error');
+                  } finally {
+                    setRefreshingPlaylist(null);
+                  }
+                };
+                return React.createElement(HeaderControl, {
+                  onClick: refresh,
+                  busy: refreshing,
+                  'data-tooltip': `Get the latest from ${serviceName} now`,
+                }, 'Refresh');
               })(),
               // Edit / Cancel+Done buttons (only for non-ephemeral playlists)
               !selectedPlaylist?.isEphemeral && (playlistEditMode ? React.createElement(React.Fragment, null,
