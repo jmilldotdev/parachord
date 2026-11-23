@@ -22,6 +22,7 @@ const { weeklySavedName } = require('../lib/weekly-saved-name');
 const { StickyBar } = require('./filter-box');
 const { useReveal, ArtOverlay } = require('./card-art');
 const { Badge } = require('./badge');
+const { pushMirrors } = require('../lib/playlist-mirrors');
 const { lbMbidOf } = require('../lib/playlist-share');
 const { HeaderControl } = require('./header-control');
 const { Button } = require('./button');
@@ -34,9 +35,12 @@ const { VirtualizedTrackList, TrackRow, TrackRowSkeleton } = require('./track-li
 const { playlistPlaybackContext } = require('../lib/playlist-context');
 const { trackSlug } = require('../lib/track-slug');
 const { countOf } = require('../lib/plural');
-const { pluginName, importSourcePluginId } = require('../lib/plugin-names');
+const { pluginName, pluginColor, importSourcePluginId } = require('../lib/plugin-names');
 const { syncBannerState } = require('../lib/playlist-sync-banner');
+const { NoticeBanner } = require('./notice-banner');
+const { duplicateCount, withoutDuplicates, offersRemoval, duplicateCopy } = require('../lib/playlist-duplicates');
 const { tracksFingerprint, refreshFromSource } = require('../../../sync-engine/auto-pull');
+const { pushHold } = require('../../../sync-engine/push-hold');
 
 // Column widths that follow the content area (#1389). At the 1000px minimum
 // window the content is 744px: a fixed 240px art column and 140px of source
@@ -67,6 +71,7 @@ const PLAYLIST_VIEW_PAGE_HANDLERS = [
   'savePlaylistToStore',
   'setPlaylistUpdateMode',
   'setQueueWithContext',
+  'showConfirmDialog',
 ];
 
 const PlaylistViewPage = React.memo(function PlaylistViewPage(props) {
@@ -126,9 +131,13 @@ const PlaylistViewPage = React.memo(function PlaylistViewPage(props) {
     setSelectedPlaylistsForAdd,
     setSyncDeleteDialog,
     setTrackLoading,
+    showConfirmDialog,
     showToast,
     trackSources,
   } = props;
+  // How many later copies of a song the playlist holds (#1635). Once per
+  // track list: a long playlist's identity pass is not free on every render.
+  const duplicateTotal = React.useMemo(() => duplicateCount(playlistTracks), [playlistTracks]);
   // The playlist's own cover, when its provider gave it one (a recommended
   // playlist's image — the same one the Recommendations page's card showed —
   // or a provider import's coverArt on a saved record). Shown instead of the
@@ -544,15 +553,6 @@ const PlaylistViewPage = React.memo(function PlaylistViewPage(props) {
             const syncState = banner.state; // 'push' | 'conflict'
             const localIsNewer = banner.localIsNewer;
 
-            // Colors based on state
-            // The status tokens (both themes), tinted.
-            const tint = (token, pct) => `color-mix(in srgb, var(${token}) ${pct}%, transparent)`;
-            const colors = {
-              push: { bg: tint('--success', 12), border: tint('--success', 25), text: 'text-ink-success', iconBg: tint('--success', 20) },
-              conflict: { bg: tint('--warning', 12), border: tint('--warning', 25), text: 'text-ink-warning', iconBg: tint('--warning', 20) }
-            };
-            const c = colors[syncState];
-
             // Push handler
             const handlePush = async () => {
               const externalId = playlist.syncedFrom?.externalId;
@@ -564,7 +564,22 @@ const PlaylistViewPage = React.memo(function PlaylistViewPage(props) {
                   name: playlist.title,
                   description: playlist.description
                 };
-                const result = await window.electron.sync.pushPlaylist(provider, externalId, playlist.tracks, metadata);
+                // Matched on the service first, like the sync's own push: the
+                // push replaces the playlist there with what matched, so it
+                // waits while any lookup went unanswered (#1637,
+                // sync-engine/push-hold.js). Sending the raw list dropped every
+                // track without a Spotify id.
+                let resolveResult;
+                try {
+                  resolveResult = await window.electron.sync.resolveTracks(provider, playlist.tracks || []);
+                } catch (resolveErr) {
+                  console.warn('Send: track lookup failed:', resolveErr);
+                }
+                if (pushHold(resolveResult)) {
+                  showToast(`Couldn’t check every track on ${providerName} just now, so nothing was sent. Try again in a minute.`, 'error');
+                  return;
+                }
+                const result = await window.electron.sync.pushPlaylist(provider, externalId, resolveResult.resolved, metadata);
                 if (result?.success) {
                   const applyPush = prev => ({
                     ...prev,
@@ -656,57 +671,75 @@ const PlaylistViewPage = React.memo(function PlaylistViewPage(props) {
               await savePlaylistToStore(updatedPlaylist);
             };
 
-            return React.createElement('div', {
-              className: 'mx-4 mb-4 overflow-hidden rounded-lg',
-              style: {
-                background: `linear-gradient(135deg, ${c.bg} 0%, ${c.bg} 100%)`,
-                border: `1px solid ${c.border}`,
-                boxShadow: `0 2px 8px ${c.bg}`
-              }
-            },
-              React.createElement('div', {
-                className: 'flex items-center justify-between px-4 py-3'
-              },
-                // Left side: icon + message
-                React.createElement('div', { className: 'flex items-center gap-3' },
-                  React.createElement('div', {
-                    className: 'flex items-center justify-center w-8 h-8 rounded-full',
-                    style: { background: c.iconBg }
-                  },
-                    React.createElement(syncState === 'push' ? Icons.Upload : Icons.AlertTriangle, { size: 16, className: c.text })
-                  ),
-                  // Plain words, not git's ("Push Local", "Pull Remote",
-                  // an uppercase SYNC CONFLICT label).
-                  React.createElement('div', { className: 'flex flex-col' },
-                    React.createElement('span', {
-                      className: 'text-ink-primary', style: { fontSize: '13px', fontWeight: 600 }
-                    }, syncState === 'push' ? 'You changed this playlist' : `This playlist changed here and on ${providerName}`),
-                    React.createElement('span', {
-                      className: 'text-ink-secondary', style: { fontSize: '13px' }
-                    }, syncState === 'push'
-                      ? `Send your changes to ${providerName}?`
-                      : localIsNewer
-                      ? 'Your version is newer.'
-                      : `${providerName}’s version is newer.`)
-                  )
-                ),
-                // The choices (the shared Button), the newer version as the
-                // primary. A conflict offered "Use X" twice when X was newer.
-                React.createElement('div', { className: 'flex items-center gap-2' },
-                  React.createElement(Button, { variant: 'text', size: 'sm', onClick: handleDismiss }, 'Dismiss'),
-                  syncState === 'push'
-                    ? React.createElement(Button, { variant: 'primary', size: 'sm', onClick: handlePush },
-                        React.createElement(Icons.Upload, { size: 14 }), `Send to ${providerName}`)
-                    : [
-                        React.createElement(Button, { key: 'mine', variant: localIsNewer ? 'primary' : 'secondary', size: 'sm', onClick: handlePush },
-                          React.createElement(Icons.Upload, { size: 14 }), 'Keep my version'),
-                        React.createElement(Button, { key: 'theirs', variant: localIsNewer ? 'secondary' : 'primary', size: 'sm', onClick: handlePull },
-                          React.createElement(Icons.Download, { size: 14 }), `Use ${providerName}’s version`)
-                      ]
-                )
-              )
-            );
+            // The shared notice (components/notice-banner.js). Plain words,
+            // not git's ("Push Local", "Pull Remote", an uppercase SYNC
+            // CONFLICT label); the newer version is the primary choice (a
+            // conflict offered "Use X" twice when X was newer).
+            return React.createElement(NoticeBanner, {
+              tone: syncState === 'push' ? 'success' : 'warning',
+              icon: syncState === 'push' ? Icons.Upload : Icons.AlertTriangle,
+              title: syncState === 'push' ? 'You changed this playlist' : `This playlist changed here and on ${providerName}`,
+              text: syncState === 'push'
+                ? `Send your changes to ${providerName}?`
+                : localIsNewer
+                ? 'Your version is newer.'
+                : `${providerName}’s version is newer.`,
+              actions: [
+                React.createElement(Button, { key: 'dismiss', variant: 'text', size: 'sm', onClick: handleDismiss }, 'Dismiss'),
+                syncState === 'push'
+                  ? React.createElement(Button, { key: 'send', variant: 'primary', size: 'sm', onClick: handlePush },
+                      React.createElement(Icons.Upload, { size: 14 }), `Send to ${providerName}`)
+                  : [
+                      React.createElement(Button, { key: 'mine', variant: localIsNewer ? 'primary' : 'secondary', size: 'sm', onClick: handlePush },
+                        React.createElement(Icons.Upload, { size: 14 }), 'Keep my version'),
+                      React.createElement(Button, { key: 'theirs', variant: localIsNewer ? 'secondary' : 'primary', size: 'sm', onClick: handlePull },
+                        React.createElement(Icons.Download, { size: 14 }), `Use ${providerName}’s version`)
+                    ]
+              ]
+            });
           })(),
+
+          // Duplicate tracks (#1635, mobile parity): later copies of a song
+          // already in the playlist (lib/playlist-duplicates.js, sync's own
+          // track identity). Removing keeps the first copy of each in place
+          // and saves like an edit, so the next sync sends the cleaned list
+          // to the mirrors and the source.
+          !playlistEditMode && offersRemoval(selectedPlaylist, duplicateTotal) && React.createElement(NoticeBanner, {
+            tone: 'info',
+            icon: Icons.Copy,
+            title: duplicateCopy.banner(duplicateTotal),
+            actions: React.createElement(Button, { variant: 'secondary', size: 'sm', onClick: () => {
+                const playlist = selectedPlaylist;
+                const count = duplicateTotal;
+                showConfirmDialog({
+                  type: 'warning',
+                  title: duplicateCopy.confirmTitle(count),
+                  message: duplicateCopy.confirmBody(playlist.title),
+                  confirmLabel: duplicateCopy.remove,
+                  destructive: true,
+                  onConfirm: async () => {
+                    const tracks = withoutDuplicates(playlistTracks);
+                    const removed = playlistTracks.length - tracks.length;
+                    if (removed <= 0) return;
+                    const updated = {
+                      ...playlist,
+                      tracks,
+                      lastModified: Date.now(),
+                      // Saved with the tracks, so the push loops send it on
+                      // (sync.md "Local-content mutators must persist
+                      // locallyModified in the same save").
+                      ...((playlist.syncedFrom || playlist.syncedTo) ? { locallyModified: true } : {})
+                    };
+                    setSelectedPlaylist(updated);
+                    setPlaylistTracks(tracks);
+                    setPlaylists(prev => prev.map(p => p.id === updated.id ? updated : p));
+                    await savePlaylistToStore(updated);
+                    markPlaylistAsLocallyModified(updated.id);
+                    showToast(duplicateCopy.done(removed));
+                  }
+                });
+              } }, duplicateCopy.remove)
+          }),
 
           // Two-column layout: playlist cover + metadata on left, tracklist on right
           // Left padding only: the tracklist's own scroll area carries the
@@ -935,19 +968,24 @@ const tracksWithIds = (playlistTracks || []).map(track => ({
                     style: { color: 'var(--text-tertiary)' }
                   }, `Source: ${sourceLabel}`);
                 })(),
-                // Where it syncs: one Badge per service, named and coloured from
-                // its plugin (an id other than Spotify read "Apple Music"), then
-                // the local-only switch as a real button that says what it does.
-                selectedPlaylist?.syncedTo && !selectedPlaylist.syncedFrom && React.createElement('div', {
+                // Where it syncs: one Badge per push mirror (lib/playlist-mirrors.js
+                // pushMirrors: a pulled playlist's too, its source left out since
+                // "Source: X" says it; #1640), named and coloured from its plugin
+                // (an id other than Spotify read "Apple Music"), then the
+                // local-only switch as a real button that says what it does.
+                (() => {
+                const mirrors = pushMirrors(selectedPlaylist);
+                return mirrors.length > 0 && React.createElement('div', {
                   className: 'flex items-center flex-wrap mt-1',
                   style: { gap: '6px' }
                 },
-                  ...Object.keys(selectedPlaylist.syncedTo).map(pid => {
-                    const service = (allResolvers || []).find(r => r.id === pid);
-                    const name = service?.name || pid;
+                  ...mirrors.map(pid => {
+                    // Name and colour from the plug-in registry (meta services
+                    // like ListenBrainz included), never the raw id.
+                    const name = pluginName(pid);
                     return React.createElement(Badge, {
                       key: pid,
-                      color: selectedPlaylist.localOnly ? undefined : (service?.color || undefined),
+                      color: selectedPlaylist.localOnly ? undefined : pluginColor(pid),
                       tooltip: selectedPlaylist.localOnly ? `Linked to ${name}, but kept local only` : `Syncs to ${name}`
                     }, name);
                   }),
@@ -963,7 +1001,8 @@ const tracksWithIds = (playlistTracks || []).map(track => ({
                       showToast(updatedPlaylist.localOnly ? 'Playlist set to local only' : 'Playlist will sync to services');
                     }
                   }, selectedPlaylist.localOnly ? 'Resume syncing' : 'Keep local only')
-                ),
+                );
+                })(),
                 // Edit mode: Title input
                 // The shared TextField (its focus ring and dark-mode colours).
                 playlistEditMode && editedPlaylistData && React.createElement(TextField, {

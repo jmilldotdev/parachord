@@ -1234,6 +1234,38 @@ module.exports = {
       return list.filter(test).slice(0, limit);
     }
 
+    // The bought copy's COID for a track (#1629). By the track's ASIN first;
+    // on Music Unlimited, resolution plays a catalog copy, often another
+    // release than the one bought, so then by the song: the same title
+    // (folded, whole: "Overthrown (Live)" is another recording) and an artist
+    // that contains the other, folded, either way round (a credit that names
+    // more artists). Several copies: the closest length, and none more than
+    // OWNED_LENGTH_SLACK_S off when both lengths are known (another
+    // recording, not this song). Only rows with a COID; null when none fits.
+    const OWNED_LENGTH_SLACK_S = 15;
+    function ownedCoidFor(tracks, { asin, title, artist, duration } = {}) {
+      const rows = (Array.isArray(tracks) ? tracks : []).filter((t) => t && t.coid);
+      const byAsin = asin ? rows.find((t) => t.asin === asin) : null;
+      if (byAsin) return byAsin.coid;
+      const wantTitle = ownedFold(title);
+      const wantArtist = ownedFold(artist);
+      if (!wantTitle || !wantArtist) return null;
+      const both = (a, b) => !!a && !!b && (a.indexOf(b) !== -1 || b.indexOf(a) !== -1);
+      const same = rows.filter((t) => ownedFold(t.title) === wantTitle && both(ownedFold(t.artist), wantArtist));
+      if (!same.length) return null;
+      const length = typeof duration === 'number' && duration > 0 ? duration : null;
+      if (length == null) return same[0].coid;
+      let best = null;
+      let bestGap = Infinity;
+      for (const t of same) {
+        const gap = typeof t.duration === 'number' && t.duration > 0 ? Math.abs(t.duration - length) : null;
+        if (gap == null) { if (!best) best = t; continue; }
+        if (gap <= OWNED_LENGTH_SLACK_S && gap < bestGap) { best = t; bestGap = gap; }
+      }
+      if (best && bestGap === Infinity && same.every((t) => typeof t.duration === 'number' && t.duration > 0)) return null;
+      return best ? best.coid : null;
+    }
+
     // ── The recommendations (#1356 M8) ───────────────────────────────────────
     // The home page's MUSIC tab and the see-more route: the request, response
     // and pagination shapes (live-captured 2026-11; see
@@ -1832,10 +1864,14 @@ module.exports = {
       };
     }
 
-    function amazonDmlsLicenseBody({ challenge, customerId, deviceId, musicAgent } = {}) {
+    // The licence request is the same call for Widevine and FairPlay: Safari
+    // sends a FairPlay SPC through getLicenseForPlaybackV2 with DrmType
+    // FAIRPLAY (Safari 27.2, 2026-11-22, #1627), not the
+    // getLicenseForPlaybackV3 its manifest reply's keyHeaders name.
+    function amazonDmlsLicenseBody({ challenge, customerId, deviceId, musicAgent, drmType } = {}) {
       if (!challenge || !customerId || !deviceId) return null;
       return {
-        DrmType: 'WIDEVINE',
+        DrmType: drmType === 'FAIRPLAY' ? 'FAIRPLAY' : 'WIDEVINE',
         licenseChallenge: String(challenge),
         customerId,
         deviceToken: { deviceTypeId: AMAZON_DEVICE_TYPE_ID, deviceId: String(deviceId) },
@@ -1869,6 +1905,79 @@ module.exports = {
       const item = list[0];
       if (!item || item.statusCode !== 'SUCCESS' || !Array.isArray(item.urlList)) return null;
       return item.urlList.find((u) => typeof u === 'string' && /^https:\/\//.test(u)) || null;
+    }
+
+    // FairPlay HLS for a catalog track, for a host without Widevine (iOS,
+    // #1627): the request Amazon's web player sends from Safari
+    // (parachord-mobile#780). Keyed by the catalog ASIN. The reply is HLS,
+    // AAC only (256 AAC-LC, 128 / 48 HE-AAC), so FairPlay tops out at
+    // 256 kbps whatever the plan. `entitlementList` is the plan's codes
+    // (amazonEntitlementList); an account with none gets no list, and Amazon
+    // refuses the manifest, as it does the web player's.
+    const FAIRPLAY_MANIFEST_TARGET = 'getStreamingURLsWithFirstChunkV2';
+    // The plan's codes the FairPlay manifest request needs in
+    // customerInfo.entitlementList: without them Amazon answers 400
+    // INVALID_MISSING_CUSTOMER_INFO, and it serves only what the codes cover
+    // (live, #1629). Amazon's web player builds them from the account's tier
+    // (convertTierToEntitlementList in its bundle, 2026-11-22; its own enum:
+    // KATANA = Unlimited HD, HAWKFIRE = Unlimited, SONIC_RUSH = augmented
+    // Prime, ROBIN = Prime, NIGHTWING = Free). Mirrored on config.json's tier
+    // (UNLIMITED_HD and the like), so the plug-in never claims a plan the
+    // account doesn't have. Anything else: none, as the web player sends.
+    const AMAZON_ENTITLEMENTS = {
+      unlimited: ['KATANA', 'HAWKFIRE', 'SONIC_RUSH', 'ROBIN', 'NIGHTWING'],
+      prime: ['SONIC_RUSH', 'ROBIN', 'NIGHTWING'],
+      free: ['NIGHTWING']
+    };
+    function amazonEntitlementList(tier) {
+      if (isUnlimitedTier(tier)) return AMAZON_ENTITLEMENTS.unlimited.slice();
+      const t = typeof tier === 'string' ? tier.trim().toUpperCase() : '';
+      if (t === 'PRIME') return AMAZON_ENTITLEMENTS.prime.slice();
+      if (t === 'FREE') return AMAZON_ENTITLEMENTS.free.slice();
+      return [];
+    }
+    function amazonFairPlayManifestBody({ asin, customerId, marketplaceId, territoryId, entitlementList, deviceId, userAgent, requestId } = {}) {
+      if (!asin || !customerId || !deviceId) return null;
+      const customerInfo = {
+        marketplaceId: String(marketplaceId || 'ATVPDKIKX0DER'),
+        territoryId: String(territoryId || 'US')
+      };
+      if (Array.isArray(entitlementList) && entitlementList.length) customerInfo.entitlementList = entitlementList.map(String);
+      return {
+        contentIdList: [{ identifier: String(asin), identifierType: 'ASIN' }],
+        customerId,
+        customerInfo,
+        protocol: 'HLS',
+        format: 'ENCRYPTED_AAC',
+        drmType: 'FAIRPLAY',
+        deviceToken: { deviceTypeId: AMAZON_DEVICE_TYPE_ID, deviceId: String(deviceId) },
+        appMetadata: { https: true, appId: WEB_APP_ID, appVersion: WEB_APP_VERSION, userAgent: String(userAgent || '') },
+        clientMetadata: { clientId: 'WebCP', clientRequestId: String(requestId || '') }
+      };
+    }
+    // What an iOS engine needs from a SUCCESS answer: the https m3u8, Amazon's
+    // FairPlay application certificate (inline; no separate request), and the
+    // header lists the manifest, segment and key requests each carry (a
+    // per-play `rid` cookie, the key's x-amz-music-* headers). Null for
+    // anything else. The URL and headers are per-play credentials: passed to
+    // the host, never logged.
+    function fairPlayStreamFromReply(json) {
+      const list = json && Array.isArray(json.contentResponseList) ? json.contentResponseList : [];
+      const item = list[0];
+      if (!item || item.statusCode !== 'SUCCESS' || !Array.isArray(item.urlList)) return null;
+      const url = item.urlList.find((u) => typeof u === 'string' && /^https:\/\//.test(u)) || null;
+      const fp = json.drmPlaybackResource && json.drmPlaybackResource.fairplay;
+      const certificate = fp && typeof fp.applicationCertificate === 'string' && fp.applicationCertificate ? fp.applicationCertificate : null;
+      if (!url || !certificate) return null;
+      const pairs = (v) => (Array.isArray(v) ? v : [])
+        .filter((h) => h && typeof h.name === 'string' && typeof h.value === 'string')
+        .map((h) => ({ name: h.name, value: h.value }));
+      const h = item.httpHeaders || {};
+      return {
+        url,
+        certificate,
+        headers: { manifest: pairs(h.manifestHeaders), segments: pairs(h.audioSegmentHeaders), key: pairs(h.keyHeaders) }
+      };
     }
 
     // GET https://music.amazon.com/config.json answers the session facts the
@@ -2566,6 +2675,7 @@ module.exports = {
       STREAMING_URLS_TARGET,
       amazonStreamingUrlsBody,
       streamingUrlFromReply,
+      ownedCoidFor,
       CSRF_HARVEST_MAX_AGE_MS, CONFIG_REUSE_MS,
       csrfHeadersFromCaptures,
       notReady,
@@ -2646,6 +2756,10 @@ module.exports = {
       amazonDmlsRegion,
       amazonDmlsManifestBody,
       amazonDmlsLicenseBody,
+      FAIRPLAY_MANIFEST_TARGET,
+      amazonEntitlementList,
+      amazonFairPlayManifestBody,
+      fairPlayStreamFromReply,
       amazonNativeSessionFromConfig,
       dashCodecFamily,
       mpdContentProtectionSets,
@@ -3798,7 +3912,14 @@ module.exports = {
       console.warn('[Amazon] bought tracks unavailable for a purchase stream: ' + ((error && error.message) || error));
       throw lib.notReady('not-ready', "Couldn't read your Amazon purchases. Try again in a minute.");
     }
-    const coid = owned.coidByAsin && owned.coidByAsin.get(asin);
+    // By the ASIN, else by the song: on Unlimited the source is a catalog
+    // copy, often not the release that was bought (#1629).
+    const coid = lib.ownedCoidFor(owned.tracks, {
+      asin,
+      title: track && track.title,
+      artist: track && track.artist,
+      duration: track && track.duration
+    });
     if (!coid) return null;
     const ctx = await this.ensureSessionContext();
     const body = lib.amazonStreamingUrlsBody({
@@ -3837,6 +3958,7 @@ module.exports = {
     // second page. The mint reuses the gate's config.json read.
     await this.assertPlanPlaysAsin(asin);
     const ctx = await this.ensureSessionContext();
+    if (this.wantsFairPlay()) return this.fairPlayManifest(asin, ctx);
     const body = lib.amazonDmlsManifestBody({
       asin,
       customerId: ctx.customerId,
@@ -3933,6 +4055,66 @@ module.exports = {
     };
   },
 
+  // A host with no Widevine engine plays FairPlay instead (#1627): iOS. The
+  // host says which it is in this.host.platform (the plug-in host contract);
+  // an app without the contract is desktop or Android, both Widevine.
+  wantsFairPlay: function () {
+    return !!(this.host && this.host.platform === 'ios');
+  },
+
+  // getPlaybackManifest's FairPlay half (#1627): the HLS URL, Amazon's
+  // certificate and the header lists, as { type: 'hls-fairplay', ... }. The
+  // host's engine builds each SPC with the certificate and hands it to
+  // relayLicense with this reply's context. Called after the plan gate.
+  fairPlayManifest: async function (asin, ctx) {
+    const lib = this.requireLib();
+    const body = lib.amazonFairPlayManifestBody({
+      asin,
+      customerId: ctx.customerId,
+      marketplaceId: ctx.marketplaceId,
+      territoryId: ctx.territoryId,
+      entitlementList: lib.amazonEntitlementList(ctx.tier),
+      deviceId: ctx.deviceId,
+      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
+      requestId: (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2)
+    });
+    if (!body) throw lib.notReady('invalid', 'Amazon Music: manifest body incomplete');
+    const { status, text } = await this.dmls(ctx, lib.FAIRPLAY_MANIFEST_TARGET, body);
+    let json = null;
+    try { json = JSON.parse(text); } catch { /* fall through */ }
+    if (status !== 200 || !json) {
+      throw lib.notReady(status === -1 ? 'load-failed' : 'playback-failed',
+        'Amazon Music: FairPlay manifest HTTP ' + status + ': ' + (lib.licenseDenialSummary(text) || '').slice(0, 160));
+    }
+    const stream = lib.fairPlayStreamFromReply(json);
+    if (!stream) {
+      const entry = json.contentResponseList && json.contentResponseList[0];
+      throw lib.notReady('playback-failed', 'Amazon Music: FairPlay manifest error ' + ((entry && entry.statusCode) || 'empty'));
+    }
+    console.log('[Amazon dmls] FairPlay manifest ' + asin);
+    return {
+      type: 'hls-fairplay',
+      drm: 'fairplay',
+      url: stream.url,
+      certificate: stream.certificate,
+      headers: stream.headers,
+      asin: String(asin),
+      context: {
+        drmType: 'FAIRPLAY',
+        customerId: ctx.customerId,
+        marketplaceId: ctx.marketplaceId,
+        territoryId: ctx.territoryId,
+        region: ctx.region,
+        tier: ctx.tier,
+        deviceType: ctx.deviceType,
+        deviceId: ctx.deviceId,
+        csrfToken: ctx.csrfToken,
+        csrfRnd: ctx.csrfRnd,
+        csrfTs: ctx.csrfTs
+      }
+    };
+  },
+
   relayLicense: async function (challengeB64, context) {
     const lib = this.requireLib();
     const challenge = String(challengeB64 || '');
@@ -3950,11 +4132,15 @@ module.exports = {
     const ctx = this._drmSessionContext
       || (context && typeof context === 'object' && context.customerId && context.csrfToken ? context : null)
       || (await this.ensureSessionContext());
+    // FairPlay or Widevine: the session's own context says (the reply that
+    // opened it), else the host (#1627). The live mint carries no DRM type.
+    const drmType = (context && context.drmType === 'FAIRPLAY') || this.wantsFairPlay() ? 'FAIRPLAY' : 'WIDEVINE';
     const body = lib.amazonDmlsLicenseBody({
       challenge,
       customerId: ctx.customerId,
       deviceId: ctx.deviceId,
-      musicAgent: await this.musicAgent()
+      musicAgent: await this.musicAgent(),
+      drmType
     });
     if (!body) throw new Error('Amazon Music: license body incomplete');
     const { status, text } = await this.dmls(ctx, 'getLicenseForPlaybackV2', body);

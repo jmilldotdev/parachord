@@ -2,6 +2,25 @@
 
 **Release date:** not yet released
 
+> Compilation albums play: their tracks find sources under each track's own artist, and the tracklist names them. A brand-new album no longer opens with no tracks, and turning off a plug-in's recommendations takes all of them off the Recommendations page at once.
+
+---
+
+## Albums
+
+- **Compilations play, and say who's on each track.** A Various Artists album, a soundtrack or a DJ mix looked up every track as "Various Artists", which matched nothing, so its tracks couldn't find a source. Each track now plays under its own artist, and the tracklist has an artist column, each name opening that artist. An album by one artist looks as before.
+- **A new album opens with its tracks.** Days after release, MusicBrainz can list empty placeholder editions of an album, and an album opened from Pop of the Tops or Critical Darlings could land on one and show no tracks (Grand Theft Auto VI: The Album did). It now opens the edition that has the track list.
+
+## Discovery
+
+- **Turning off a plug-in's recommendations takes all of them off the page.** With "Use recommendations from ListenBrainz" off, its similar listeners stayed in the Listeners row, and ListenBrainz stayed in the page's filter bar. Both now go as soon as you turn it off.
+
+---
+
+# Parachord v0.9.14
+
+**Release date:** 2026-11-23
+
 > Amazon plays the songs you've bought on any account, Bandcamp only offers tracks you can play, Subsonic can report your plays to your server, and related artists, top tracks, discographies, charts, your listening history and artist bios come from every plug-in that has them. Saving a playlist no longer freezes the app, a synced playlist can be refreshed on the spot, and a plug-in that needs you to sign in no longer looks turned on until you have.
 
 ---
@@ -34,8 +53,13 @@
 - **Refresh a synced playlist now.** A playlist that comes from a service, such as a Daily Brew rebuilt every morning or a playlist you follow, has a Refresh button at the top, so you don't wait for the next sync. It says whether anything changed, and when the service sends nothing back, it says so and leaves your playlist as it was.
 - **A synced playlist shows its latest tracks.** After a sync brought in a playlist's new tracks, opening it could still show an older list, and Export saved that older list. Both now show what the playlist really holds. Editing such a playlist no longer puts the older list back, on Parachord or on your services.
 - **Daily playlists update with the next sync.** Every sync now checks every playlist you sync for changes, so one that's rebuilt daily is picked up within one sync, even with a long list of playlists. A rebuilt playlist also keeps its created date.
+- **Playlists from a link keep your edits across restarts.** Every start of Parachord rebuilt each playlist you'd imported from a link (a hosted XSPF) from the link itself, which undid any edits you'd made to it here and moved it to the top of Recently modified. It's now updated in place, and only when the link's tracklist changes.
+- **Recently modified means the tracks changed.** The Playlists page's and the Add to playlist panel's Recently modified, and Home's "Your playlists, freshest first", now go by when a playlist's tracks last changed. Parachord finding sources for a playlist's songs no longer counts, so playlists you haven't touched stop jumping to the top, and Home says "Refreshed" only when a playlist's tracks really changed.
 - **A playlist from a link isn't "changed by you" when the link changes.** An update to a hosted playlist no longer asks whether to keep your changes when you made none.
+- **Sync no longer removes tracks it couldn't look up.** Sending a playlist to another service first looks each song up there. When a lookup failed, because the service was rate-limiting Parachord, the network dropped or ListenBrainz's lookup service was down, Parachord treated the song as missing on that service and left it out, and the playlist there lost it. Now it waits and tries again on the next sync. Only a song the service really doesn't have is left out.
+- **Remove a playlist's duplicate tracks in one go.** When a playlist holds the same song more than once, its page says how many duplicates there are and offers Remove duplicates. The first copy of each song stays where it is, and your other services get the cleaned list on the next sync. A live version, a remix or a different recording of the same name doesn't count as a duplicate.
 - **Saved weekly playlists get their own names.** Saving a Weekly Jams or Weekly Exploration now names it by its kind and week, such as "Weekly Exploration · Nov 17, 2026", so two weeks never share a name, and one can't overwrite another on your services.
+- **A synced playlist shows everywhere it syncs to.** A playlist that comes from one service and that Parachord also keeps on others, such as a Spotify playlist mirrored to Apple Music and ListenBrainz, now shows a badge for each of those services on its page, in each service's colour. It used to show only where it came from.
 - **Playlist covers look right.** A cover with see-through corners no longer shows the album mosaic behind it. Mosaics use a song's own cover even when it has no album name, and look up at most 12 albums per playlist.
 
 ## Speed
@@ -45,11 +69,13 @@
 ## Settings and plug-ins
 
 - **A plug-in that needs a sign-in doesn't look turned on until you sign in.** Its switches and its tile on the Plug-Ins page read as off, and its settings put your account first. Your choices are kept and come back when you sign in.
+- **Import your Last.fm loves again.** The loved-tracks import had gone missing from Last.fm's settings unless you were signed in to scrobble to Last.fm. Importing needs only your username, so it's back in Last.fm's and ListenBrainz's settings whether you scrobble there or not. Both now show loved tracks the same way: Import loved tracks, a Push loves switch (which does need the scrobbling sign-in), and Send for the loves you saved before turning that on.
 - **Each music plug-in's settings say how its playback quality is set.** In Parachord's Playback Quality setting, or, for Spotify and for Apple Music through the Music app, in that app's own settings.
 
 ## Smaller fixes
 
 - In History, an album's name opens the album, as the artist's name opens the artist. Thanks to @theli-ua.
+- A sidebar item's "+1" badge no longer nudges its row and everything below it down for a moment.
 - Home's concert cards open the artist's On Tour tab, as the Concerts page does, and concerts near you no longer match a state's letters inside another city's name.
 - A history mix's "Playing from" opens the mix, not Home.
 - Asking Shuffleupagus for a mix without saying how many songs gives you 10.
