@@ -5,6 +5,16 @@
  * Makes scrobble manager available globally as window.scrobbleManager
  */
 
+// A MusicBrainz MBID (recording, release or artist): a 36-char UUID. Guards
+// every MBID that leaves for a service, so a half-set or garbage field never
+// replaces a real one and no scrobble sends a value LB or Last.fm would
+// reject silently.
+const validMbid = (m) => typeof m === 'string' && /^[a-f0-9-]{36}$/i.test(m);
+
+// How long a scrobble waits for its scrobble-time MBID lookup
+// (ListenBrainzScrobbler._ensureMbidIdentity) before it goes out without one.
+const MBID_LOOKUP_BUDGET_MS = 5000;
+
 // ============================================================================
 // ScrobbleManager - Manages scrobbling state and dispatches to enabled plugins
 // ============================================================================
@@ -504,7 +514,6 @@ class ListenBrainzScrobbler extends BaseScrobbler {
     const out = {};
     const sources = (track && track.sources) || {};
     const isHttp = (u) => typeof u === 'string' && /^https?:\/\//i.test(u);
-    const isMbid = (m) => typeof m === 'string' && /^[a-f0-9-]{36}$/i.test(m);
 
     // Group 1 + 2: scan high-confidence sources for provider IDs, then
     // pick out the played source's URL/service identity.
@@ -549,14 +558,14 @@ class ListenBrainzScrobbler extends BaseScrobbler {
     }
 
     // Group 3: MBID enrichment.
-    if (isMbid(track && track.mbid)) {
+    if (validMbid(track && track.mbid)) {
       out.recording_mbid = track.mbid;
     }
-    if (isMbid(track && track.releaseMbid)) {
+    if (validMbid(track && track.releaseMbid)) {
       out.release_mbid = track.releaseMbid;
     }
     if (Array.isArray(track && track.artistMbids)) {
-      const valid = track.artistMbids.filter(isMbid);
+      const valid = track.artistMbids.filter(validMbid);
       if (valid.length > 0) out.artist_mbids = valid;
     }
 
@@ -573,6 +582,61 @@ class ListenBrainzScrobbler extends BaseScrobbler {
     }
 
     return out;
+  }
+
+  // Give a listen its MBID identity if it never got one. The played track
+  // carries `mbid` / `releaseMbid` / `artistMbids` when the MBID Mapper batch
+  // enrichment (queue adds, playlist loads) ran before the play — but a track
+  // played straight from search, or before its batch enrichment landed, or a
+  // queued retry (the manager's retry queue keeps only title, artist, album
+  // and length), reaches the scrobble threshold with none. This is the last
+  // place that can ask: one lookup through window.resolveRecordingMbid (the
+  // same mapper + labs acr-lookup path the rest of the app uses,
+  // mbid-lookup.js), filling only what's missing, so an enrichment already on
+  // the track always wins. A listen that carries recording_mbid / release_mbid
+  // pins LB to the exact recording and release, and LB skips its own mapping
+  // hop. Best-effort by contract: nothing here may fail or slow the scrobble
+  // beyond the one lookup — a mapper that can't be reached submits the listen
+  // without MBIDs, exactly as before. The lookup gets MBID_LOOKUP_BUDGET_MS:
+  // the manager scrobbles to each plug-in in turn, ListenBrainz first, so a
+  // mapper that takes the connection and never answers would otherwise hold
+  // this listen and the Last.fm / Libre.fm scrobbles behind it. An answer
+  // that lands after the budget is dropped, so it never changes the track
+  // once the listen has gone.
+  async _ensureMbidIdentity(track) {
+    if (!track || !track.artist || !track.title) return;
+    if (validMbid(track.mbid) && validMbid(track.releaseMbid)) return;
+    if (typeof window === 'undefined' || typeof window.resolveRecordingMbid !== 'function') return;
+    try {
+      let timer;
+      const outOfTime = new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ status: 'timeout', result: null }), MBID_LOOKUP_BUDGET_MS);
+      });
+      const lookup = window.resolveRecordingMbid(track.artist, track.title, track.album, { background: true });
+      let answer;
+      try {
+        answer = await Promise.race([lookup, outOfTime]);
+      } finally {
+        clearTimeout(timer);
+      }
+      const { status, result } = answer || {};
+      if (status !== 'hit' || !result || !validMbid(result.recording_mbid)) return;
+      // The lookup goes by artist and title, so the answer can be another
+      // recording of the song. Its release and artists belong to that
+      // recording: take them only when the track had no recording of its own
+      // (it takes the answer's) or the answer is the track's recording.
+      // Otherwise leave them out and LB picks the release from the recording,
+      // rather than pinning the listen to an album the played recording may
+      // not be on (#1670).
+      if (!validMbid(track.mbid)) track.mbid = result.recording_mbid;
+      if (track.mbid.toLowerCase() !== result.recording_mbid.toLowerCase()) return;
+      if (!validMbid(track.releaseMbid) && validMbid(result.release_mbid)) track.releaseMbid = result.release_mbid;
+      if (!Array.isArray(track.artistMbids) && Array.isArray(result.artist_credit_mbids) && result.artist_credit_mbids.length > 0) {
+        track.artistMbids = result.artist_credit_mbids;
+      }
+    } catch {
+      // Mapper unreachable: the listen goes out without MBIDs, as before.
+    }
   }
 
   async updateNowPlaying(track) {
@@ -621,6 +685,11 @@ class ListenBrainzScrobbler extends BaseScrobbler {
       throw new Error('ListenBrainz token not configured');
     }
 
+    // Last chance for the listen's MBID identity (see _ensureMbidIdentity):
+    // the scrobble is the payload that matters, and the threshold wait has
+    // given slower enrichments 30+ seconds to land.
+    await this._ensureMbidIdentity(track);
+
     const payload = {
       listen_type: 'single',
       payload: [{
@@ -654,6 +723,20 @@ class ListenBrainzScrobbler extends BaseScrobbler {
     }
 
     return true;
+  }
+
+  // What a queued retry of a failed scrobble keeps beyond title, artist,
+  // album and length (the manager's _queuedTrackFor asks): the listen's MBID
+  // identity, so a retry after a network failure carries the recording_mbid
+  // and release_mbid the original listen had — both known means no second
+  // mapper ask; only one known and the backstop below re-asks for the other.
+  // artist_mbids can't ride (the queue keeps plain values only); LB re-derives
+  // it.
+  queuedTrack(track) {
+    const out = {};
+    if (validMbid(track && track.mbid)) out.mbid = track.mbid;
+    if (validMbid(track && track.releaseMbid)) out.releaseMbid = track.releaseMbid;
+    return out;
   }
 
   // Submit love feedback to ListenBrainz. Used by the optional opt-in
@@ -1003,7 +1086,14 @@ class LastFmScrobbler extends BaseScrobbler {
       'track[0]': track.title,
       'timestamp[0]': timestamp,
       'album[0]': track.album || undefined,
-      'duration[0]': track.duration || undefined
+      'duration[0]': track.duration || undefined,
+      // Recording MBID from the track's MBID Mapper enrichment, when it
+      // reached the played track (use-playback-engine.js mbidIdentity):
+      // scrobbling by MBID pins the scrobble to the exact recording instead
+      // of a fuzzy artist/title match. ListenBrainz listens get the same
+      // identity in additional_info (ListenBrainzScrobble
+      // _deriveSourceEnrichment).
+      'mbid[0]': validMbid(track.mbid) ? track.mbid : undefined
     });
     return true;
   }
@@ -1455,6 +1545,7 @@ if (typeof module !== 'undefined' && module.exports) {
     ListenBrainzScrobbler,
     LastFmScrobbler,
     LibreFmScrobbler,
-    formatSubmissionClientVersion
+    formatSubmissionClientVersion,
+    MBID_LOOKUP_BUDGET_MS
   };
 }
