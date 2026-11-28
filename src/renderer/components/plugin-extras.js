@@ -58,7 +58,9 @@ const DEFAULT_AUTH_PORT = 8888;
 
 // A section of the dialog: a line above it, then its rows.
 const SECTION = { padding: '16px 0', borderTop: '1px solid var(--border-subtle)' };
-// A block inside a section, divided from what's above it by a line.
+// A block inside a section, divided from what's above it by a line (Local
+// Files' library under its folders). Never a top-level section: one after a
+// section doubles the space over its line, and a section after it has none.
 const BLOCK = { marginTop: '16px', paddingTop: '16px', borderTop: '1px solid var(--border-subtle)' };
 const NOTE = { fontSize: '11px', lineHeight: '1.5' };
 const TONE = { success: 'var(--text-success)', secondary: 'var(--text-secondary)', warning: 'var(--text-warning)' };
@@ -298,14 +300,14 @@ function LibrarySync({ plugin, settings, signedOut, openSyncSetupModal, setProvi
   const id = plugin.id;
   const state = librarySyncState(settings, signedOut);
   if (state === 'setup') {
-    return e('div', { style: BLOCK }, e(SettingRow, { label: 'Sync your library', hint: 'Bring your saved music and playlists into your Collection', style: { padding: 0 } },
+    return e('div', { style: SECTION }, e(SettingRow, { label: 'Sync your library', hint: 'Bring your saved music and playlists into your Collection', style: { padding: 0 } },
       e(Button, { variant: 'secondary', onClick: () => openSyncSetupModal(id), 'aria-label': 'Set up library sync' }, 'Set up')));
   }
   const last = settings?.lastSyncAt ? `Last synced ${new Date(settings.lastSyncAt).toLocaleString()}` : 'Not synced yet';
   const hint = state === 'paused' ? `Paused. Your synced music stays. ${last}`
     : state === 'signed-out' ? 'Signed out. Sign in above to sync again.'
     : last;
-  return e('div', { style: { ...BLOCK, display: 'flex', flexDirection: 'column', gap: '12px' } },
+  return e('div', { style: { ...SECTION, display: 'flex', flexDirection: 'column', gap: '12px' } },
     e(SettingRow, { label: 'Sync your library', hint, style: { padding: 0 } },
       e(Switch, {
         // On only while it syncs, as the Collection's Sync menu shows it;
@@ -327,7 +329,7 @@ function LibrarySync({ plugin, settings, signedOut, openSyncSetupModal, setProvi
 //   startup  the host's: { on, toggle() }
 function StartupRow({ plugin, startup }) {
   const e = React.createElement;
-  return e('div', { style: BLOCK },
+  return e('div', { style: SECTION },
     e(SettingRow, { label: `Open ${plugin.name} at startup`, hint: settingsOf(plugin).startup.hint, style: { padding: 0 } },
       e(Switch, { checked: !!startup.on, onToggle: startup.toggle, 'aria-label': `Open ${plugin.name} in the background at startup` })));
 }
@@ -421,8 +423,12 @@ function LovedTracks({
         : `Importing… ${importProgress.done} of ${importProgress.total}`)
     : state && state.importReady ? `Add your ${name} ${w.plural} to your Collection`
     : (state && state.importHint) || `Set up ${name} first`;
-  const pluralCap = w.plural.charAt(0).toUpperCase() + w.plural.slice(1);
-  return e('div', { 'data-section': 'loved-tracks', style: { ...SECTION, ...(inAccount ? { paddingBottom: 0 } : {}), display: 'flex', flexDirection: 'column', gap: '12px' } },
+  // Inside an account it's a section under the account's line; otherwise a
+  // section like its neighbours in "what needs the sign-in" (LibrarySync,
+  // StartupRow), with the same space above and below each line.
+  // The service's verb is for what happens there (Push favorites, Import
+  // favorited tracks); what you send is your loves, Parachord's word.
+  return e('div', { 'data-section': 'loved-tracks', style: { ...(inAccount ? { ...SECTION, paddingBottom: 0 } : SECTION), display: 'flex', flexDirection: 'column', gap: '12px' } },
     canImport && onImport && e(SettingRow, { label: `Import ${w.tracksNoun}`, hint: importHint, style: { padding: 0 } },
       e(Button, { variant: 'secondary', size: 'sm', onClick: onImport, busy: !!importRunning, disabled: !(state && state.importReady) },
         hasImported ? 'Import new' : 'Import')),
@@ -433,10 +439,10 @@ function LovedTracks({
     },
       e(Switch, { checked: signedIn && !!pushEnabled, disabled: !signedIn, onToggle: (v) => onSetPush(v), 'aria-label': `Push ${w.plural} to ${name}` })),
     signedIn && onSend && unpushedCount > 0 && e(SettingRow, {
-      label: `Send ${countOf(unpushedCount, `${w.past} track`)} to ${name}`,
+      label: `Send ${countOf(unpushedCount, 'loved track')} to ${name}`,
       hint: sendRunning && sendProgress
         ? `Sending… ${sendProgress.done} of ${sendProgress.total}`
-        : `${pluralCap} from before you turned this on. ${name} dates them today.`,
+        : `Loves from before you turned this on. ${name} dates them today.`,
       style: { padding: 0 },
     },
       e(Button, { variant: 'secondary', size: 'sm', onClick: onSend, busy: !!sendRunning }, 'Send')));

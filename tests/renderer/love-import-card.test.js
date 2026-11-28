@@ -14,7 +14,7 @@ global.ReactVirtual = require('@tanstack/react-virtual');
 
 const React = require('react');
 const { renderToStaticMarkup } = require('react-dom/server');
-const { LovedTracks } = require('../../src/renderer/components/plugin-extras');
+const { LovedTracks, LibrarySync, StartupRow } = require('../../src/renderer/components/plugin-extras');
 const LP = require('../../src/renderer/lib/love-providers');
 
 const noop = () => {};
@@ -113,12 +113,32 @@ describe('the loved-tracks rows', () => {
     const notSetUp = draw({});
     expect(notSetUp).toContain('Import starred tracks');
     expect(notSetUp).toContain('Set up My Server first');
-    expect(notSetUp).not.toContain('Send 2 starred tracks');
+    expect(notSetUp).not.toContain('Send 2 loved tracks');
     const ready = draw({ serverUrl: 'http://s' });
     expect(ready).toContain('Add your My Server stars to your Collection');
     expect(ready).toContain('Push stars to My Server');
     expect(ready).toContain('Star it on My Server when you love it here');
-    expect(ready).toContain('Send 2 starred tracks to My Server');
+    // What you send is your loves, in Parachord's word, whatever the service calls them.
+    expect(ready).toContain('Send 2 loved tracks to My Server');
+    expect(ready).not.toContain('starred tracks to My Server');
+    expect(ready).toContain('Loves from before you turned this on.');
+  });
+});
+
+describe('spacing', () => {
+  // Sync your library, Open at startup and Loved tracks follow one another
+  // and a section like Playback quality: each is a section, padded above and
+  // below its line, so every line has the same space on both sides. A
+  // margin-only block left none under the last one (2026-11-28).
+  const rootStyle = (el) => renderToStaticMarkup(el).match(/^<div[^>]*style="([^"]*)"/)[1];
+  test.each([
+    ['library sync', () => React.createElement(LibrarySync, { plugin: { id: 'x', name: 'X' }, settings: null, openSyncSetupModal: noop, setProviderSyncEnabled: noop, setStopSyncDialog: noop })],
+    ['startup', () => React.createElement(StartupRow, { plugin: { id: 'x', name: 'X', settings: { startup: { hint: 'h' } } }, startup: { on: false, toggle: noop } })],
+    ['loved tracks', () => React.createElement(LovedTracks, { name: 'X', canImport: false, state: { signedIn: true }, onSetPush: noop })],
+  ])('%s is a padded section', (_, el) => {
+    const style = rootStyle(el());
+    expect(style).toContain('padding:16px 0');
+    expect(style).not.toContain('margin-top');
   });
 });
 
@@ -131,7 +151,8 @@ describe('the dialog', () => {
     expect(dialog).toContain('onImport: () => runLoveImport(id),');
     expect(dialog).toContain('importRunning: !!loveImportRunning[id],');
     expect(dialog).toContain('hasImported: !!loveImportCursorRef.current?.[id],');
-    expect(dialog).toContain("state: loveRowState(selectedResolver, { name, scrobblerConfig: scrobblerConfigs[id], pluginConfig: metaServiceConfigs[id] }),");
+    // A plug-in that signs in (Apple Music) is ready when the app knows it's signed in (#1559 step 5).
+    expect(dialog).toContain("state: loveRowState(selectedResolver, { name, scrobblerConfig: scrobblerConfigs[id], pluginConfig: metaServiceConfigs[id], signedIn }),");
   });
 
   test('the scrobbler card no longer draws them', () => {
