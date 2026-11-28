@@ -1323,9 +1323,10 @@ const { playlistShareTarget, notSyncedSharePrompt, playlistListenbrainzMbid, lbM
 const achordionUserUrl = (username) => `https://achordion.xyz/user/${encodeURIComponent(username)}`;
 const { emptyRecommendationsMessage } = require('./lib/recommendations-empty');
 const {
-  blockedItemPick, normalizeRecommendationSections, buildRecommendationPage, buildRecommendationViews, flattenRecommendationItems, homeRecommendationAlbums,
+  blockedItemPick, cacheWithoutProvider, normalizeRecommendationSections, buildRecommendationPage, buildRecommendationViews, flattenRecommendationItems, homeRecommendationAlbums,
   filterRowBySource, pageSources, weeklyHomeEntries, shuffleupagusSection, categoryFor
 } = require('./lib/recommendation-model');
+const { lastViewPlaylistFields, restoreKind, linkRestoreRecord, restoreViewHistory, restoreFallbackView } = require('./lib/ephemeral-playlist-restore');
 const { releaseDateKey, releaseGroupSearchUrl, pickReleaseGroupDate, upcomingLabel, RELEASE_DATE_TTL_MS } = require('./lib/release-date');
 const { formatCalendarDate } = require('./lib/calendar-date');
 const { albumsNeedingTrackCount, trackCountFromRelease, runAlbumTrackCountSync } = require('./lib/album-track-counts');
@@ -18868,14 +18869,12 @@ ${trackListXml}
           } else if (savedLastView.view === 'playlist-view' && savedLastView.playlistId) {
             // Restore playlist detail view - need to find the playlist by ID
             setActiveView('playlist-view');
-            // Use different view history for ephemeral playlists (e.g., Weekly Jams from home)
-            if (savedLastView.isHistoryMix || (savedLastView.isEphemeral && savedLastView.playlistSource === 'listenbrainz')) {
-              setViewHistory(['home', 'playlist-view']);
-            } else {
-              setViewHistory(['library', 'playlists', 'playlist-view']);
-            }
-            // Store pending playlist load - will be processed once playlists are loaded
-            // For ephemeral ListenBrainz playlists, include extra info for reconstruction
+            // Back goes to Home for a history mix, Recommendations for any
+            // other unsaved playlist, Playlists for a saved one.
+            setViewHistory(restoreViewHistory(savedLastView));
+            // Store pending playlist load - processed once the playlists (a
+            // saved one), Home's weekly rows (a weekly one) or the plug-ins (one
+            // rebuilt from its link) are loaded (lib/ephemeral-playlist-restore.js).
             setPendingPlaylistLoad({
               id: savedLastView.playlistId,
               title: savedLastView.playlistTitle,
@@ -18883,7 +18882,11 @@ ${trackListXml}
               isHistoryMix: savedLastView.isHistoryMix,
               source: savedLastView.playlistSource,
               listenbrainzId: savedLastView.listenbrainzId,
-              weekLabel: savedLastView.weekLabel
+              weekLabel: savedLastView.weekLabel,
+              sourceUrl: savedLastView.sourceUrl,
+              creator: savedLastView.playlistCreator,
+              description: savedLastView.description,
+              coverArt: savedLastView.coverArt
             });
             console.log(`📦 Restoring last view: playlist-view (${savedLastView.playlistTitle})${savedLastView.isEphemeral ? ' [ephemeral]' : ''}`);
           } else if (savedLastView.view === 'discover') {
@@ -19518,21 +19521,13 @@ ${trackListXml}
       viewData.collectionTab = collectionTab;
     }
     if (activeView === 'playlist-view' && selectedPlaylist) {
-      viewData.playlistId = selectedPlaylist.id;
-      viewData.playlistTitle = selectedPlaylist.title;
-      // Save extra info for ephemeral playlists so they can be reconstructed
-      if (selectedPlaylist.isEphemeral) {
-        viewData.isEphemeral = true;
-        viewData.playlistSource = selectedPlaylist.source;
-        // A history mix lives on Home, so a relaunch falls back there.
-        const mixProviders = (historyMixesCache.current && historyMixesCache.current.providers) || {};
-        viewData.isHistoryMix = Object.values(mixProviders).some((entry) =>
-          entry && Array.isArray(entry.items) && entry.items.some((m) => `${entry.resolverId}-rec-${m.id}` === selectedPlaylist.id));
-        if (selectedPlaylist.listenbrainzId) {
-          viewData.listenbrainzId = selectedPlaylist.listenbrainzId;
-          viewData.weekLabel = selectedPlaylist.weekLabel;
-        }
-      }
+      // An unsaved playlist saves what rebuilds it: its weekly id, or its
+      // link and what the view showed (lib/ephemeral-playlist-restore.js,
+      // #1519). A history mix lives on Home, so Back goes there.
+      const mixProviders = (historyMixesCache.current && historyMixesCache.current.providers) || {};
+      const isHistoryMix = !!selectedPlaylist.isEphemeral && Object.values(mixProviders).some((entry) =>
+        entry && Array.isArray(entry.items) && entry.items.some((m) => `${entry.resolverId}-rec-${m.id}` === selectedPlaylist.id));
+      Object.assign(viewData, lastViewPlaylistFields(selectedPlaylist, { isHistoryMix }));
     }
     if (activeView === 'friendHistory' && currentFriend) {
       viewData.friendId = currentFriend.id;
@@ -19591,70 +19586,76 @@ ${trackListXml}
     }
   }, [currentArtist]);
 
-  // Load pending playlist once playlists are loaded
+  // Load pending playlist once what it needs is loaded (#1519: no plug-in
+  // named, lib/ephemeral-playlist-restore.js).
   useEffect(() => {
-    if (pendingPlaylistLoad) {
-      // For ephemeral ListenBrainz playlists (Weekly Jams/Exploration), look in homeData
-      if (pendingPlaylistLoad.isEphemeral && pendingPlaylistLoad.source === 'listenbrainz' && pendingPlaylistLoad.listenbrainzId) {
-        const jam = homeData.weeklyJams?.find(j => j.id === pendingPlaylistLoad.listenbrainzId)
-          || homeData.weeklyExploration?.find(j => j.id === pendingPlaylistLoad.listenbrainzId);
-        if (jam) {
-          console.log(`📦 Reconstructing ephemeral playlist for restored view: ${jam.title}`);
-          setPendingPlaylistLoad(null);
-          // Reconstruct the ephemeral playlist object
-          const ephemeralPlaylist = {
-            id: `listenbrainz-${jam.id}`,
-            listenbrainzId: jam.id,
-            title: jam.title,
-            weekLabel: jam.weekLabel,
-            date: jam.date || null,
-            description: jam.description,
-            tracks: jam.tracks || [],
-            tracksLoaded: jam.tracksLoaded,
-            isExternal: true,
-            isEphemeral: true,
-            source: 'listenbrainz',
-            creator: 'ListenBrainz'
-          };
-          loadPlaylist(ephemeralPlaylist, { skipNavigation: true });
-          return;
-        }
-        // Weekly playlists not loaded yet - wait for them
-        return;
-      }
-
-      // For regular playlists, look in playlists array
-      const playlist = playlists.find(p => p.id === pendingPlaylistLoad.id);
-      if (playlist) {
-        console.log(`📦 Loading playlist for restored view: ${playlist.title}`);
-        setPendingPlaylistLoad(null); // Clear only when found
-        // Use loadPlaylist to properly parse XSPF and populate playlistTracks
-        // Skip navigation since we already set activeView to 'playlist-view'
-        loadPlaylist(playlist, { skipNavigation: true });
-      }
-      // Don't clear pending or fall back yet - hosted playlists may still be loading
+    if (!pendingPlaylistLoad) return;
+    const kind = restoreKind(pendingPlaylistLoad);
+    // A weekly playlist, in Home's weekly rows by its weekly id, whatever
+    // plug-in sent it. Waits for the rows.
+    if (kind === 'weekly') {
+      const jam = homeData.weeklyJams?.find(j => j.id === pendingPlaylistLoad.listenbrainzId)
+        || homeData.weeklyExploration?.find(j => j.id === pendingPlaylistLoad.listenbrainzId);
+      if (!jam) return;
+      console.log(`📦 Reconstructing ephemeral playlist for restored view: ${jam.title}`);
+      setPendingPlaylistLoad(null);
+      const source = pendingPlaylistLoad.source || null;
+      loadPlaylist({
+        id: pendingPlaylistLoad.id || `${source}-${jam.id}`,
+        listenbrainzId: jam.id,
+        title: jam.title,
+        weekLabel: jam.weekLabel,
+        date: jam.date || null,
+        description: jam.description,
+        tracks: jam.tracks || [],
+        tracksLoaded: jam.tracksLoaded,
+        isExternal: true,
+        isEphemeral: true,
+        source,
+        creator: source ? pluginName(source) : null
+      }, { skipNavigation: true });
+      return;
     }
-  }, [playlists, pendingPlaylistLoad, homeData.weeklyJams, homeData.weeklyExploration]);
+    // Any plug-in's unsaved playlist with a link (a recommended playlist, a
+    // history mix): rebuilt from the link through the plug-in the registry
+    // says owns it, once the plug-ins have loaded. Its tracks load through the
+    // shared lookup, as they did when it was opened.
+    if (kind === 'link') {
+      const resolverId = resolverLoaderRef.current?.findResolverForUrl(pendingPlaylistLoad.sourceUrl) || null;
+      if (!resolverId) return;
+      console.log(`📦 Rebuilding ephemeral playlist from its link for restored view: ${pendingPlaylistLoad.title}`);
+      const record = linkRestoreRecord(pendingPlaylistLoad, resolverId);
+      const item = { id: pendingPlaylistLoad.id, url: pendingPlaylistLoad.sourceUrl, name: pendingPlaylistLoad.title, resolverId };
+      setPendingPlaylistLoad(null);
+      loadPlaylist({ ...record, creator: record.creator || pluginName(resolverId), fetchTracks: () => recommendationPlaylistTracks(item) }, { skipNavigation: true });
+      return;
+    }
+    if (kind === 'ephemeral') return; // can't be rebuilt: the timeout below sends it back
+    // A saved playlist, in the playlists by id. Hosted ones may still be
+    // loading, so this waits rather than falling back.
+    const playlist = playlists.find(p => p.id === pendingPlaylistLoad.id);
+    if (playlist) {
+      console.log(`📦 Loading playlist for restored view: ${playlist.title}`);
+      setPendingPlaylistLoad(null);
+      // loadPlaylist parses XSPF and fills playlistTracks; the view is already set.
+      loadPlaylist(playlist, { skipNavigation: true });
+    }
+  }, [playlists, pendingPlaylistLoad, homeData.weeklyJams, homeData.weeklyExploration, loadedResolvers]);
 
   // Give up on pending playlist load after timeout (hosted playlists should be loaded by then)
   useEffect(() => {
     if (pendingPlaylistLoad) {
       const timer = setTimeout(() => {
         if (pendingPlaylistLoad) {
-          // For ephemeral ListenBrainz playlists, fall back to Recommendations
-          // (its Playlists section holds Weekly Jams and Exploration). Through
-          // navigateTo so the page loads on arrival; the history then starts
-          // there, as the old fallback's did.
-          if (pendingPlaylistLoad.isHistoryMix) {
-            console.log(`📦 History mix not restorable: ${pendingPlaylistLoad.title}, falling back to Home`);
+          // Not found or rebuilt in time: a history mix goes back to Home,
+          // any other unsaved playlist to Recommendations (through navigateTo,
+          // so the page loads on arrival), a saved one to Playlists.
+          const fallback = restoreFallbackView(pendingPlaylistLoad);
+          if (fallback !== 'playlists') {
+            console.log(`📦 Playlist not restorable: ${pendingPlaylistLoad.title}, falling back to ${fallback}`);
             setPendingPlaylistLoad(null);
-            navigateTo('home');
-            setViewHistory(['home']);
-          } else if (pendingPlaylistLoad.isEphemeral && pendingPlaylistLoad.source === 'listenbrainz') {
-            console.log(`📦 Weekly Jam not found after timeout: ${pendingPlaylistLoad.title}, falling back to recommendations view`);
-            setPendingPlaylistLoad(null);
-            navigateTo('recommendations');
-            setViewHistory(['recommendations']);
+            navigateTo(fallback);
+            setViewHistory([fallback]);
           } else {
             console.log(`📦 Playlist not found after timeout: ${pendingPlaylistLoad.title}, falling back to playlists view`);
             setPendingPlaylistLoad(null);
@@ -24699,18 +24700,17 @@ ${trackListXml}
         setMetaServices(prev => prev.filter(s => s.id !== resolverId));
         // Clear the service's config so dependent features (recommendations, weekly jams) stop
         await clearMetaServiceConfig(resolverId);
-        // Clear cached data that depends on this service
-        if (resolverId === 'lastfm' || resolverId === 'listenbrainz') {
-          setRecommendations({ sections: [], loading: false, error: 'not_configured' });
-          recommendationsCache.current = { providers: {}, timestamp: 0 };
-          saveRecommendationsCache();
-        }
-        if (resolverId === 'listenbrainz') {
-          setHomeData(prev => ({ ...prev, weeklyJams: null, weeklyExploration: null }));
-        }
       } else {
         setLoadedResolvers(prev => prev.filter(r => r.id !== resolverId));
       }
+      // Forget ITS cached recommendations, similar listeners and history
+      // mixes, and keep everyone else's (#1519; any plug-in, by what it
+      // cached, never a name). The page and Home's weekly rows rebuild
+      // without it when the provider set changes.
+      recommendationsCache.current = cacheWithoutProvider(recommendationsCache.current, resolverId);
+      saveRecommendationsCache();
+      historyMixesCache.current = cacheWithoutProvider(historyMixesCache.current, resolverId);
+      saveHistoryMixesCache();
       setResolverOrder(prev => prev.filter(id => id !== resolverId));
       setActiveResolvers(prev => prev.filter(id => id !== resolverId));
       // Drop its status reply too (a status-capable plugin): the entry is
