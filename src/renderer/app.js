@@ -1394,7 +1394,7 @@ const { OWN_KEY_REFUSED_NOTICE: LASTFM_OWN_KEY_REFUSED_NOTICE, OWN_KEY_REFUSED_H
 const { trackDurationLabel } = require('./lib/track-duration');
 const { contextPlaylistTarget, playlistRef, playlistPlaybackContext, withLinkFetch } = require('./lib/playlist-context');
 const { pulledOpenPlaylist } = require('./lib/playlist-sync-banner');
-const { SERVICE_REFRESH_MS, playlistUpdateMode, isPolledHostedXspf, serviceRefreshDue, hostedListForMode } = require('./lib/playlist-update-mode');
+const { SERVICE_REFRESH_MS, playlistUpdateMode, isPolledHostedXspf, serviceRefreshDue, hostedListForMode, isSourceGone, hostedStatusIsGone, goneSnapshotMessage } = require('./lib/playlist-update-mode');
 const { refreshedTracks } = require('./lib/hosted-refresh');
 const { shouldPushToSource, recordPushToSource, tracksFingerprint } = require('../../sync-engine/auto-pull');
 const { pushHold } = require('../../sync-engine/push-hold');
@@ -32607,7 +32607,7 @@ Variety guidance: ${theme} Be creative and surprising — avoid defaulting to th
     if (problem) throw new Error(problem);
     const result = await window.electron.publicFetch(url, 'hosted-playlist');
     if (!result || !result.success) throw new Error(result?.error || 'Failed to fetch the playlist');
-    if (!result.ok) throw new Error(`Failed to fetch: ${result.status}`);
+    if (!result.ok) throw Object.assign(new Error(`Failed to fetch: ${result.status}`), hostedStatusIsGone(result.status) ? { reason: 'not-found' } : {});
     // Belt and braces: the main process already enforced both.
     const afterProblem = window.hostedPlaylistFetchProblem(url, result.finalUrl, result.text.length);
     if (afterProblem) throw new Error(afterProblem);
@@ -32957,6 +32957,7 @@ Variety guidance: ${theme} Be creative and surprising — avoid defaulting to th
       return true;
     } catch (error) {
       console.error('Refresh error:', error);
+      if (await snapshotGoneSource(playlist, error)) return false;
       if (!background) showToast(error?.message || 'Could not refresh playlist', 'error');
       return false;
     }
@@ -33010,7 +33011,7 @@ Variety guidance: ${theme} Be creative and surprising — avoid defaulting to th
 
   // Switch a link-imported playlist between kept updated and a snapshot.
   // Keeping it updated also brings it up to date now.
-  const setPlaylistUpdateMode = async (playlistId, mode) => {
+  const setPlaylistUpdateMode = async (playlistId, mode, { quiet = false } = {}) => {
     const playlist = (playlistsRef.current || []).find(p => p.id === playlistId);
     if (!playlist?.sourceUrl) return;
     const providerImported = window.isProviderImportedPlaylist(playlist, resolverLoaderRef.current);
@@ -33032,9 +33033,23 @@ Variety guidance: ${theme} Be creative and surprising — avoid defaulting to th
       // playlistsRef catches up on the next render; refresh reads it.
       playlistsRef.current = (playlistsRef.current || []).map(p => (p.id === playlistId ? updated : p));
       await refreshHostedPlaylist(playlistId);
-    } else {
+    } else if (!quiet) {
       showToast(`“${playlist.title}” is now a snapshot`);
     }
+  };
+
+  // A kept-updated playlist whose source is gone for good (the service says
+  // so: a plug-in's `reason: 'not-found'`, a hosted document's 404 or 410)
+  // becomes a snapshot, keeping its tracks, and says so once. Any other
+  // failure keeps retrying. True when it switched (lib/playlist-update-mode.js).
+  const snapshotGoneSource = async (playlist, error) => {
+    if (!isSourceGone(error) || !playlist) return false;
+    const providerImported = window.isProviderImportedPlaylist(playlist, resolverLoaderRef.current);
+    if (playlistUpdateMode(playlist, { providerImported }) !== 'auto') return false;
+    await setPlaylistUpdateMode(playlist.id, 'snapshot', { quiet: true });
+    const resolverId = resolverLoaderRef.current?.findResolverForUrl(playlist.sourceUrl) || null;
+    showToast(goneSnapshotMessage(playlist.title, resolverId ? pluginName(resolverId) : null));
+    return true;
   };
 
   // Poll hosted playlists for updates
@@ -33068,6 +33083,7 @@ Variety guidance: ${theme} Be creative and surprising — avoid defaulting to th
           }
         } catch (error) {
           console.error(`Failed to check playlist ${playlist.title}:`, error);
+          if (await snapshotGoneSource(playlist, error)) continue;
         }
       }
     };

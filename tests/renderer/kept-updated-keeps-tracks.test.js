@@ -21,7 +21,7 @@ const slice = (from, to) => {
 };
 
 test('turning Auto-update off saves the whole playlist, its tracks included, as a snapshot', () => {
-  const fn = slice('const setPlaylistUpdateMode = async (playlistId, mode) => {', '\n  };\n');
+  const fn = slice('const setPlaylistUpdateMode = async (playlistId, mode, { quiet = false } = {}) => {', '\n  };\n');
   expect(fn).toContain("const updated = { ...playlist, autoUpdate: mode === 'auto' };");
   expect(fn).toContain('await window.electron.playlists.save(window.buildPlaylistSavePayload(updated));');
   expect(fn).not.toMatch(/tracks:\s*\[\]/);

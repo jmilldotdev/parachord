@@ -293,6 +293,13 @@ module.exports = {
         }
       }
     }
+    // ListenBrainz says the playlist doesn't exist (deleted, as old Daily
+    // Jams are): `reason: 'not-found'`, so a saved copy kept updated from it
+    // becomes a snapshot instead of retrying forever (docs/architecture/
+    // plugins.md, lookupPlaylist). Any other failure is a plain error.
+    if (response && response.status === 404) {
+      throw Object.assign(new Error('That ListenBrainz playlist no longer exists'), { reason: 'not-found' });
+    }
     if (!response || !response.ok) {
       throw new Error(`Failed to fetch the ListenBrainz playlist: ${response ? response.status : 'no response'}`);
     }
