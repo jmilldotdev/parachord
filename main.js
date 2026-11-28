@@ -4364,6 +4364,13 @@ ipcMain.handle('show-track-context-menu', async (event, data) => {
       menuLabel = 'Add to Queue';
       break;
     case 'playlist':
+      // A service's playlist whose tracks are still on their way (a
+      // recommended playlist right-clicked before its lookup landed, #1659).
+      if (!(data.tracks?.length > 0) && data.loading) {
+        menuLabel = 'Add All to Queue (loading…)';
+        enabled = false;
+        break;
+      }
       menuLabel = `Add All to Queue (${trackCount(data.tracks?.length || 0)})`;
       enabled = data.tracks?.length > 0;
       break;
@@ -4389,7 +4396,9 @@ ipcMain.handle('show-track-context-menu', async (event, data) => {
       addToPlaylistLabel = 'Add to Playlist...';
       break;
     case 'playlist':
-      addToPlaylistLabel = `Add All to Playlist... (${trackCount(data.tracks?.length || 0)})`;
+      addToPlaylistLabel = !(data.tracks?.length > 0) && data.loading
+        ? 'Add All to Playlist… (loading…)'
+        : `Add All to Playlist... (${trackCount(data.tracks?.length || 0)})`;
       break;
     case 'release':
       if (data.tracks?.length > 0) {
@@ -4405,6 +4414,17 @@ ipcMain.handle('show-track-context-menu', async (event, data) => {
   }
 
   const menuItems = [];
+
+  // A service's playlist that isn't saved yet (a recommended playlist, #1659):
+  // save it without opening it. The renderer runs the same save as the
+  // opened playlist's Save (lib/save-service-playlist.js).
+  if (data.type === 'playlist' && data.saveUrl) {
+    menuItems.push({
+      label: 'Save to Playlists',
+      click: () => safeSendToRenderer('track-context-menu-action', { action: 'save-service-playlist', url: data.saveUrl, name: data.name, coverArt: data.coverArt || null })
+    });
+    menuItems.push({ type: 'separator' });
+  }
 
   // Only add queue/playlist options for types that have playable tracks
   // Exclude friend-track since it has its own specific menu items

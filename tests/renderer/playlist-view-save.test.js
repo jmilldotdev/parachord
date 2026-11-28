@@ -1,7 +1,8 @@
 /**
  * The ephemeral-playlist SAVE button (PlaylistViewPage): a provider playlist
  * (a recommended playlist opened from the Recommendations page) saves through
- * the Import path — the same record the Import button produces — and the
+ * saveServicePlaylist (lib/save-service-playlist.js, the link import), the
+ * same save as the card's right-click "Save to Playlists" (#1659), and the
  * Weekly Jams record spreads the whole playlist (buildPlaylistSavePayload's
  * rule: a field left out of a hand-picked list is deleted when the store
  * replaces the record).
@@ -18,13 +19,14 @@ describe('the ephemeral playlist SAVE button', () => {
   const saveEnd = src.indexOf("bg-orange-500", saveStart);
   const save = src.slice(saveStart, saveEnd);
 
-  test('a provider playlist saves through the Import path (both buttons produce the same record)', () => {
+  test('a provider playlist saves through the one shared save (the card\'s Save to Playlists runs it too)', () => {
     expect(saveStart).toBeGreaterThan(-1);
     expect(save).toContain('if (selectedPlaylist.sourceUrl) {');
-    // The full arg list, pinned: (url, skipStorageUpdate, storedAddedAt,
-    // metadataOverrides, opts) — coverArt must ride as the 4th arg.
-    expect(save).toContain('await handleImportPlaylistFromUrl(');
-    expect(save).toMatch(/selectedPlaylist\.sourceUrl,\s*false,\s*null,\s*selectedPlaylist\.coverArt \? \{ coverArt: selectedPlaylist\.coverArt \} : null\s*\);/);
+    // The cover this view shows rides along, so the saved record keeps it.
+    expect(save).toContain('await saveServicePlaylist({ url: selectedPlaylist.sourceUrl, name: selectedPlaylist.title, coverArt: selectedPlaylist.coverArt || null });');
+    // And that save is the link import with the cover as its 4th argument
+    // (url, skipStorageUpdate, storedAddedAt, metadataOverrides).
+    expect(app).toContain('importFromUrl: (link, overrides, opts) => handleImportPlaylistFromUrl(link, false, null, overrides, opts),');
   });
 
   test('the Weekly Jams record spreads the whole playlist, no hand-picked field list', () => {
@@ -39,11 +41,11 @@ describe('the ephemeral playlist SAVE button', () => {
     expect(rec).toContain('delete newPlaylist.isEphemeral');
   });
 
-  test('handleImportPlaylistFromUrl is threaded as a stable handler on both sides', () => {
+  test('saveServicePlaylist is threaded as a stable handler on both sides', () => {
     // The handlers list and the props destructure in playlist-view-page.js…
-    expect(src).toMatch(/PLAYLIST_VIEW_PAGE_HANDLERS = \[[\s\S]*'handleImportPlaylistFromUrl'/);
-    expect(src).toMatch(/^\s{4}handleImportPlaylistFromUrl,$/m);
+    expect(src).toMatch(/PLAYLIST_VIEW_PAGE_HANDLERS = \[[\s\S]*'saveServicePlaylist'/);
+    expect(src).toMatch(/^\s{4}saveServicePlaylist,$/m);
     // …and the useStableHandlers call in app.js (keys must match).
-    expect(app).toMatch(/handleExportPlaylist, handleImportPlaylistFromUrl, handlePlay/);
+    expect(app).toMatch(/savePlaylistToStore, saveServicePlaylist, setPlaylistUpdateMode/);
   });
 });

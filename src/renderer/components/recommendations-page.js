@@ -31,6 +31,7 @@ const { releaseMenu, artistMenu, playlistMenu } = require('../lib/item-menus');
 const RECOMMENDATIONS_PAGE_HANDLERS = [
   'addServicePlaylistToPlaylist',
   'albumCardActions',
+  'cachedServicePlaylistTracks',
   'cancelRecommendationPlaylistPrefetch',
   'copyParachordLink',
   'fetchAlbumTracksFromMusicBrainz',
@@ -58,6 +59,7 @@ const RecommendationsPage = React.memo(function RecommendationsPage(props) {
     addServicePlaylistToPlaylist,
     albumCardActions,
     allResolvers,
+    cachedServicePlaylistTracks,
     cancelRecommendationPlaylistPrefetch,
     collectionData,
     copyParachordLink,
@@ -356,10 +358,20 @@ React.createElement('p', {
                 // queue. Import is the opened playlist's Save.
                 onAddToPlaylist: () => addRecommendationPlaylistToPlaylist(item),
                 onPlay: () => playRecommendationPlaylist(item),
-                onQueue: () => queueRecommendationPlaylist(item)
-                // No right-click action. It used to open the playlist's service
-                // page in the web browser with no menu and no label. Nothing
-                // opens a browser unless the control says it will.
+                onQueue: () => queueRecommendationPlaylist(item),
+                // Right-click: the playlist menu, with "Save to Playlists" first
+                // (#1659: save it without opening it). Its tracks show at once
+                // when the hover's prefetch already has them, else "loading…"
+                // while this starts the lookup.
+                onContextMenu: () => {
+                  const cached = cachedServicePlaylistTracks(item);
+                  if (!cached) prefetchRecommendationPlaylist(item);
+                  window.showItemMenu(playlistMenu(
+                    { id: `${item.resolverId}-rec-${item.id}`, title: item.name || item.title, creator: itemSourceName(item, section) || null },
+                    cached || [],
+                    { isEphemeral: true, saveUrl: item.url, coverArt: art || null, loading: !cached }
+                  ));
+                }
               });
             };
 

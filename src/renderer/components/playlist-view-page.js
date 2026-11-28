@@ -60,7 +60,6 @@ const PLAYLIST_VIEW_PAGE_HANDLERS = [
   'fetchArtistData',
   'getPlaylistMirrorTargets',
   'handleExportPlaylist',
-  'handleImportPlaylistFromUrl',
   'handlePlay',
   'handlePlaylistDragEnd',
   'linkUpdateMode',
@@ -69,6 +68,7 @@ const PLAYLIST_VIEW_PAGE_HANDLERS = [
   'navigateTo',
   'refreshHostedPlaylist',
   'savePlaylistToStore',
+  'saveServicePlaylist',
   'setPlaylistUpdateMode',
   'setQueueWithContext',
   'showConfirmDialog',
@@ -112,7 +112,7 @@ const PlaylistViewPage = React.memo(function PlaylistViewPage(props) {
     refreshingPlaylist,
     resolverOrder,
     savePlaylistToStore,
-    handleImportPlaylistFromUrl,
+    saveServicePlaylist,
     selectedPlaylist,
     setAddToPlaylistPanel,
     setDraggedPlaylistTrack,
@@ -286,16 +286,12 @@ const PlaylistViewPage = React.memo(function PlaylistViewPage(props) {
                   // (hosted-<url-hash> id, the provider snapshot shape), so the
                   // two buttons can never disagree.
                   if (selectedPlaylist.sourceUrl) {
-                    // coverArt rides along as a metadata override so the saved
-                    // record keeps the exact cover this view is showing (the
-                    // lookup's own cover can be a different crop of the same
-                    // playlist's image; the override wins).
-                    await handleImportPlaylistFromUrl(
-                      selectedPlaylist.sourceUrl,
-                      false,
-                      null,
-                      selectedPlaylist.coverArt ? { coverArt: selectedPlaylist.coverArt } : null
-                    );
+                    // The same save as the card's right-click "Save to
+                    // Playlists" (#1659, lib/save-service-playlist.js). The
+                    // cover this view shows rides along as an override, so the
+                    // saved record keeps it (the lookup's own cover can be a
+                    // different crop of the same image).
+                    await saveServicePlaylist({ url: selectedPlaylist.sourceUrl, name: selectedPlaylist.title, coverArt: selectedPlaylist.coverArt || null });
                     return;
                   }
                   // Weekly Jams from Home: save to library. Built by spreading

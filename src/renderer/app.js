@@ -1291,6 +1291,7 @@ const { normalizeForId, generateTrackId, generateAlbumId, generateArtistId, isPl
 // the run (runLoveImport) lives in hooks/use-loves.js.
 const LoveImport = require('./lib/love-import');
 const { registerBuiltInLoveProviders, loveSyncRows } = require('./lib/love-providers');
+const { saveServicePlaylist: saveServicePlaylistLink } = require('./lib/save-service-playlist');
 const { loveTombstoneEntries } = LoveImport;
 
 // Generate a unique hash from a string (for deterministic pattern generation)
@@ -3661,6 +3662,9 @@ const Parachord = () => {
   // The latest collection album opener, for an album page's Try again: the
   // retry is stored on the page and must not call a render's stale closure.
   const handleCollectionAlbumClickRef = useRef(null);
+  // The save behind a recommended playlist's "Save to Playlists" (#1659),
+  // read by the native menu's listener, which is registered once.
+  const saveServicePlaylistRef = useRef(null);
   // The release on screen now, for timers and async callbacks (the album
   // catalog race) that must not act on a stale closure.
   const currentReleaseRef = useRef(null);
@@ -14726,6 +14730,9 @@ ${trackListXml}
               lastModified: Date.now()
             }));
           }
+        } else if (data.action === 'save-service-playlist' && data.url) {
+          // A recommended playlist's "Save to Playlists" (#1659).
+          if (saveServicePlaylistRef.current) saveServicePlaylistRef.current({ url: data.url, name: data.name, coverArt: data.coverArt });
         } else if (data.action === 'export-playlist' && data.playlistId) {
           // Read via playlistsRef for the same stale-closure reason as delete below.
           const playlistToExport = (playlistsRef.current || []).find(p => p.id === data.playlistId);
@@ -32987,6 +32994,19 @@ Variety guidance: ${theme} Be creative and surprising — avoid defaulting to th
   // Already imported from this link: importing it again refreshes it, as
   // before, and doesn't ask.
   const isPlaylistLinkImported = (url) => (playlistsRef.current || []).some(p => p.sourceUrl === url);
+  // Save a service playlist to the person's playlists without opening it
+  // (#1659): the card's right-click "Save to Playlists" and the opened
+  // playlist's Save both run this (lib/save-service-playlist.js), the link
+  // import that fetches the list and saves it, resolving nothing.
+  const saveServicePlaylist = ({ url, name, coverArt }) => saveServicePlaylistLink({ url, name, coverArt }, {
+    isImported: isPlaylistLinkImported,
+    importFromUrl: (link, overrides, opts) => handleImportPlaylistFromUrl(link, false, null, overrides, opts),
+    findSaved: (link) => (playlistsRef.current || []).find((p) => p.sourceUrl === link) || null,
+    openPlaylist: (playlist) => loadPlaylist(playlist),
+    showToast,
+    errorText,
+  });
+  saveServicePlaylistRef.current = saveServicePlaylist;
 
   // Switch a link-imported playlist between kept updated and a snapshot.
   // Keeping it updated also brings it up to date now.
@@ -34805,9 +34825,9 @@ useEffect(() => {
   // PLAYLIST_VIEW_PAGE_HANDLERS in playlist-view-page.js).
   const playlistViewPageHandlers = useStableHandlers({
     addToQueue, copyParachordLink, deletePlaylistLocally, fetchArtistData,
-    getPlaylistMirrorTargets, handleExportPlaylist, handleImportPlaylistFromUrl, handlePlay, handlePlaylistDragEnd,
+    getPlaylistMirrorTargets, handleExportPlaylist, handlePlay, handlePlaylistDragEnd,
     linkUpdateMode, markPlaylistAsLocallyModified, moveInEditedPlaylist, navigateTo,
-    refreshHostedPlaylist, savePlaylistToStore, setPlaylistUpdateMode, setQueueWithContext,
+    refreshHostedPlaylist, savePlaylistToStore, saveServicePlaylist, setPlaylistUpdateMode, setQueueWithContext,
     showConfirmDialog,
   });
 
@@ -34839,7 +34859,9 @@ useEffect(() => {
     const cache = recommendationPlaylistLookupsRef.current;
     const hit = cache.get(item.url);
     if (hit && Date.now() - hit.at < PLAYLIST_LOOKUP_TTL) return hit.promise;
-    const entry = { promise: loadPlaylistTracks(item), at: Date.now() };
+    const entry = { promise: loadPlaylistTracks(item), at: Date.now(), resolved: null };
+    // Kept once it lands, so a right-click can show the tracks at once.
+    entry.promise.then((resolved) => { entry.resolved = resolved; }, () => {});
     cache.set(item.url, entry);
     entry.promise.catch(() => { if (cache.get(item.url) === entry) cache.delete(item.url); });
     return entry.promise;
@@ -34863,7 +34885,10 @@ useEffect(() => {
   };
   const recommendationPlaylistTracks = async (item) => {
     const resolved = await lookupRecommendationPlaylist(item);
-    return resolved.tracks.map((t) => ({
+    return servicePlaylistTracksFrom(resolved);
+  };
+  // One mapping for every playlist action and the right-click menu.
+  const servicePlaylistTracksFrom = (resolved) => ((resolved && resolved.tracks) || []).map((t) => ({
       id: trackSlug(t.artist || '', t.title || ''),
       title: t.title,
       artist: t.artist,
@@ -34889,6 +34914,14 @@ useEffect(() => {
       ...(t.isrc ? { isrc: t.isrc } : {}),
       ...(t.mbid ? { mbid: t.mbid } : {})
     }));
+  // The tracks of a service playlist the lookup already has (the hover's
+  // prefetch landed), or null: the right-click menu shows them at once, or
+  // reads "loading…" (#1659).
+  const cachedServicePlaylistTracks = (item) => {
+    if (!item || !item.url) return null;
+    const hit = recommendationPlaylistLookupsRef.current.get(item.url);
+    if (!hit || !hit.resolved || Date.now() - hit.at >= PLAYLIST_LOOKUP_TTL) return null;
+    return servicePlaylistTracksFrom(hit.resolved);
   };
 
   // Play, or add to the queue, a service playlist (a recommended playlist,
@@ -35447,7 +35480,7 @@ useEffect(() => {
   // the service-playlist functions it passes: a hook above their
   // declarations reads them in the TDZ.
   const recommendationsPageHandlers = useStableHandlers({
-    addServicePlaylistToPlaylist, albumCardActions, cancelRecommendationPlaylistPrefetch, copyParachordLink, fetchAlbumTracksFromMusicBrainz, fetchArtistData, handleCollectionAlbumClick, loadPlaylist, loadRecommendations, loadWeeklyJamTracks, navigateToFriend, observedRowRef, openServicePlaylist, playArtistTopTracks, playListenerTopTracks, playServicePlaylist, playTrackRow, prefetchRecommendationPlaylist, prefetchTopAlbumTracks, queueServicePlaylist, toggleRecommendationSection, trackRowDrag,
+    addServicePlaylistToPlaylist, albumCardActions, cachedServicePlaylistTracks, cancelRecommendationPlaylistPrefetch, copyParachordLink, fetchAlbumTracksFromMusicBrainz, fetchArtistData, handleCollectionAlbumClick, loadPlaylist, loadRecommendations, loadWeeklyJamTracks, navigateToFriend, observedRowRef, openServicePlaylist, playArtistTopTracks, playListenerTopTracks, playServicePlaylist, playTrackRow, prefetchRecommendationPlaylist, prefetchTopAlbumTracks, queueServicePlaylist, toggleRecommendationSection, trackRowDrag,
   });
 
   // Stable function props for the memo'd HomePage (keys must match
