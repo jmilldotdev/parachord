@@ -39,12 +39,18 @@ describe('recommendations wiring', () => {
     expect(observer).toContain('recommendationsTracksRef.current');
   });
 
-  test('the plugin-uninstall path writes the sectioned state and cache shapes', () => {
-    const i = app.indexOf("if (resolverId === 'lastfm' || resolverId === 'listenbrainz') {", app.indexOf('removeResolverSources(resolverId)'));
-    const block = app.slice(i, i + 400);
-    expect(block).toMatch(/setRecommendations\(\{ sections: \[\], loading: false, error: 'not_configured' \}\)/);
-    expect(block).toMatch(/recommendationsCache\.current = \{ providers: \{\}, timestamp: 0 \}/);
-    expect(block).not.toMatch(/artists: \[\]/);
+  test('the plugin-uninstall path forgets only the removed plug-in\'s cached answers (#1519)', () => {
+    // Any plug-in, by what it cached: it used to wipe every provider's
+    // answers, and only for Last.fm and ListenBrainz. The page rebuilds
+    // without it when the provider set changes (lib/recommendation-model.js
+    // cacheWithoutProvider; tests/renderer/ephemeral-playlist-restore.test.js).
+    const i = app.indexOf('// Hot-reload: Remove from state without restarting');
+    expect(i).toBeGreaterThan(-1);
+    const block = app.slice(i, app.indexOf('setResolverOrder(prev => prev.filter(id => id !== resolverId));', i));
+    expect(block).toContain('recommendationsCache.current = cacheWithoutProvider(recommendationsCache.current, resolverId);');
+    expect(block).toContain('saveRecommendationsCache();');
+    expect(block).not.toMatch(/recommendationsCache\.current = \{ providers: \{\}/);
+    expect(block).not.toContain("resolverId === 'listenbrainz'");
   });
 
   test('a provider that answers empty is never cached (the next visit asks again)', () => {
@@ -564,10 +570,13 @@ describe('the five-section page render', () => {
     const drawer = app.slice(app.indexOf("} else if (playbackContext.type === 'weekly-jam' || playbackContext.type === 'weekly-exploration') {"));
     expect(drawer.slice(0, 300)).toContain("navigateTo('recommendations');");
     expect(drawer.slice(0, 300)).not.toContain("navigateTo('home')");
+    // The launch restore's fallback for any unsaved playlist but a history
+    // mix is Recommendations (lib/ephemeral-playlist-restore.js, #1519).
     const timeout = app.slice(app.indexOf('// Give up on pending playlist load after timeout'));
-    const ephemeral = timeout.slice(0, timeout.indexOf('} else {'));
-    expect(ephemeral).toContain("navigateTo('recommendations');");
-    expect(ephemeral).not.toContain("setActiveView('home')");
+    expect(timeout.slice(0, 1200)).toContain('const fallback = restoreFallbackView(pendingPlaylistLoad);');
+    expect(timeout.slice(0, 1200)).toContain('navigateTo(fallback);');
+    const { restoreFallbackView } = require('../../src/renderer/lib/ephemeral-playlist-restore');
+    expect(restoreFallbackView({ isEphemeral: true, listenbrainzId: 'wk' })).toBe('recommendations');
   });
 
   test('the sidebar keeps Recommendations lit on a recommended playlist, Playlists on your own', () => {

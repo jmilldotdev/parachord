@@ -33,7 +33,7 @@ const PAGE_MODULES = [
   'components/new-playlist-dialog.js',
   'components/queue-save-dialog.js',
   'components/url-import-dialog.js',
-  'components/amazon-manage-dialog.js',
+  'components/plugin-sign-in-dialog.js',
   'components/sync-delete-dialog.js',
   'components/nway-migration-dialog.js',
   'components/sync-channel-disable-dialog.js',
@@ -44,6 +44,7 @@ const PAGE_MODULES = [
   'components/playlist-view-page.js',
   // State-domain hooks moved out of the Parachord component (#1487).
   'hooks/use-local-files.js',
+  'hooks/use-loves.js',
   // Module-level code moved out of app.js with them.
   'lib/resolver-order.js',
   'lib/ai-services.js',

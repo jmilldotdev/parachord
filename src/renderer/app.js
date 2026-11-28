@@ -831,27 +831,33 @@ async function checkAppleMusicUserToken(developerToken, extraTokens = []) {
 // developer token, no user token, or Apple refuses every stored token (after
 // adopting one it still accepts, if any), so the Recommendations page never
 // caches a refusal as "nothing for you"; any other failure throws plainly.
+// The account calls go through lib/apple-music-api.js with these: the
+// developer token, the app's user token of record, and the re-check that
+// adopts another token Apple still accepts.
+const AppleMusicApi = require('./lib/apple-music-api');
+const appleMusicApiDeps = {
+  fetch: (...args) => fetch(...args),
+  getDeveloperToken: () => getMusicKitDeveloperToken(),
+  getUserToken: () => localStorage.getItem(AppleMusicUserToken.APP_TOKEN_KEY),
+  recheckUserToken: (developerToken) => checkAppleMusicUserToken(developerToken),
+};
 window.appleMusicPersonalRecommendations = async (limit = 30) => {
-  const notReady = (code, message) => Object.assign(new Error(message), { notReady: true, code });
-  const developerToken = await getMusicKitDeveloperToken();
-  if (!developerToken) throw notReady('no-developer-token', 'Apple Music developer token unavailable');
   const n = Math.max(1, Math.min(30, Number(limit) || 30));
-  const url = `https://api.music.apple.com/v1/me/recommendations?limit=${n}`;
-  const ask = (userToken) => fetch(url, { headers: { Authorization: `Bearer ${developerToken}`, 'Music-User-Token': userToken } });
-  let userToken = localStorage.getItem(AppleMusicUserToken.APP_TOKEN_KEY) || '';
-  if (!userToken) throw notReady('not-signed-in', 'Not signed in to Apple Music');
-  let res = await ask(userToken);
-  if (res.status === 401 || res.status === 403) {
-    const check = await checkAppleMusicUserToken(developerToken);
-    if (check.verdict !== 'ok' || !check.token || check.token === userToken) {
-      throw notReady('token-refused', `Apple Music refused the sign-in (HTTP ${res.status})`);
-    }
-    userToken = check.token;
-    res = await ask(userToken);
-    if (res.status === 401 || res.status === 403) throw notReady('token-refused', `Apple Music refused the sign-in (HTTP ${res.status})`);
-  }
+  const res = await AppleMusicApi.appleMusicUserFetch(appleMusicApiDeps, `https://api.music.apple.com/v1/me/recommendations?limit=${n}`);
   if (!res.ok) throw new Error(`Apple Music recommendations failed: ${res.status}`);
   return res.json();
+};
+
+// The `musicKit` host bridge (the plug-in host contract, #1561;
+// docs/architecture/plugins.md): what the Apple Music plug-in reaches as
+// this.host.musicKit, declared in its manifest's optionalHostBridges.
+// lib/plugin-host-supplier.js reads it from here. Narrow on purpose: whether
+// the account is signed in, and favouriting one catalog song (its loves,
+// #1559 step 5). Moving the plug-in's other window.appleMusic* helpers onto
+// it is the contract's migration, its own change.
+window.__parachordMusicKit = {
+  isSignedIn: async () => !!localStorage.getItem(AppleMusicUserToken.APP_TOKEN_KEY) && !!(await getMusicKitDeveloperToken()),
+  favoriteSong: (catalogId) => AppleMusicApi.favoriteSong(appleMusicApiDeps, catalogId),
 };
 
 // MusicKit-enabled Apple Music search wrapper
@@ -1282,8 +1288,10 @@ window.isMusicKitAvailable = () => {
 const { normalizeForId, generateTrackId, generateAlbumId, generateArtistId, isPlaceholderAlbum, findSavedTrack, clearPlaceholderAlbums } = require('./lib/collection-ids');
 // Loved-tracks import helpers (parachord#1071) — pure parsing/plan/
 // tombstone/cursor logic per docs/plans/2026-11-06-import-loved-tracks.md;
-// the run (runLoveImport) and fetchers live below.
+// the run (runLoveImport) lives in hooks/use-loves.js.
 const LoveImport = require('./lib/love-import');
+const { registerBuiltInLoveProviders, loveSyncRows } = require('./lib/love-providers');
+const { saveServicePlaylist: saveServicePlaylistLink } = require('./lib/save-service-playlist');
 const { loveTombstoneEntries } = LoveImport;
 
 // Generate a unique hash from a string (for deterministic pattern generation)
@@ -1315,9 +1323,10 @@ const { playlistShareTarget, notSyncedSharePrompt, playlistListenbrainzMbid, lbM
 const achordionUserUrl = (username) => `https://achordion.xyz/user/${encodeURIComponent(username)}`;
 const { emptyRecommendationsMessage } = require('./lib/recommendations-empty');
 const {
-  blockedItemPick, normalizeRecommendationSections, buildRecommendationPage, buildRecommendationViews, flattenRecommendationItems, homeRecommendationAlbums,
+  blockedItemPick, cacheWithoutProvider, normalizeRecommendationSections, buildRecommendationPage, buildRecommendationViews, flattenRecommendationItems, homeRecommendationAlbums,
   filterRowBySource, pageSources, weeklyHomeEntries, shuffleupagusSection, categoryFor
 } = require('./lib/recommendation-model');
+const { lastViewPlaylistFields, restoreKind, linkRestoreRecord, restoreViewHistory, restoreFallbackView } = require('./lib/ephemeral-playlist-restore');
 const { releaseDateKey, releaseGroupSearchUrl, pickReleaseGroupDate, upcomingLabel, RELEASE_DATE_TTL_MS } = require('./lib/release-date');
 const { formatCalendarDate } = require('./lib/calendar-date');
 const { albumsNeedingTrackCount, trackCountFromRelease, runAlbumTrackCountSync } = require('./lib/album-track-counts');
@@ -1385,7 +1394,7 @@ const { OWN_KEY_REFUSED_NOTICE: LASTFM_OWN_KEY_REFUSED_NOTICE, OWN_KEY_REFUSED_H
 const { trackDurationLabel } = require('./lib/track-duration');
 const { contextPlaylistTarget, playlistRef, playlistPlaybackContext, withLinkFetch } = require('./lib/playlist-context');
 const { pulledOpenPlaylist } = require('./lib/playlist-sync-banner');
-const { SERVICE_REFRESH_MS, playlistUpdateMode, isPolledHostedXspf, serviceRefreshDue, hostedListForMode } = require('./lib/playlist-update-mode');
+const { SERVICE_REFRESH_MS, playlistUpdateMode, isPolledHostedXspf, serviceRefreshDue, hostedListForMode, isSourceGone, hostedStatusIsGone, goneSnapshotMessage } = require('./lib/playlist-update-mode');
 const { refreshedTracks } = require('./lib/hosted-refresh');
 const { shouldPushToSource, recordPushToSource, tracksFingerprint } = require('../../sync-engine/auto-pull');
 const { pushHold } = require('../../sync-engine/push-hold');
@@ -2034,6 +2043,7 @@ const { useVolume } = require('./hooks/use-volume');
 const { usePlaybackQueue } = require('./hooks/use-playback-queue');
 const { usePlaybackEngine } = require('./hooks/use-playback-engine');
 const { useLocalFiles } = require('./hooks/use-local-files');
+const { useLoves } = require('./hooks/use-loves');
 // The Collection with local files merged in (#1532): one song list, one
 // album list, every source on each entry.
 // When resolveTrack's local-file gate applies: everything not on screen (#1532).
@@ -2070,7 +2080,8 @@ const { StopSyncDialog } = require('./components/stop-sync-dialog');
 const { SyncChannelDisableDialog } = require('./components/sync-channel-disable-dialog');
 const { NwayMigrationDialog } = require('./components/nway-migration-dialog');
 const { SyncDeleteDialog } = require('./components/sync-delete-dialog');
-const { AmazonManageDialog } = require('./components/amazon-manage-dialog');
+const { PluginSignInDialog } = require('./components/plugin-sign-in-dialog');
+const { createPluginSignInFlow, newSignInState } = require('./lib/plugin-sign-in-flow');
 const { UrlImportDialog } = require('./components/url-import-dialog');
 const { QueueSaveDialog } = require('./components/queue-save-dialog');
 const { NewPlaylistDialog } = require('./components/new-playlist-dialog');
@@ -3374,16 +3385,20 @@ const Parachord = () => {
   }, []);
   const seekingRef = useRef(false); // True while user is dragging the progress slider
   const seekTimeoutRef = useRef(null); // Debounce timeout for clearing seeking state
-  // Amazon Music sign-in dialog (promise-based).
-  // { show, onResolve: callback(true|false), relaunching: boolean }
-  const [amazonManageDialog, setAmazonManageDialog] = useState({
-    show: false,
-    onResolve: null,
-    relaunching: false
-  });
-  const amazonManageInFlightRef = useRef(null);
-  const amazonManageDeclinedUntilRef = useRef(0);
-  const amazonSignInHiccupRef = useRef({ firstAt: 0, lastAt: 0 }); // not-signed-in while the cookies say signed in (the plugin's signInPromptDecision)
+  // A plug-in's sign-in question (#1624, components/plugin-sign-in-dialog.js),
+  // promise-based: { show, pluginId, name, hint, refused, signingIn,
+  // onResolve(true|false) }. lib/plugin-sign-in-flow.js decides when it
+  // shows; what the flow remembers per plug-in (its quiet period after a Not
+  // now, its prompt in flight, its hiccup streak) lives in the ref, because
+  // the flow is built each render over that render's functions.
+  const [pluginSignInDialog, setPluginSignInDialog] = useState({ show: false });
+  const pluginSignInStateRef = useRef(null);
+  if (!pluginSignInStateRef.current) pluginSignInStateRef.current = newSignInState();
+  // Plug-ins whose play was refused as signed out while their status still
+  // read signed in (the flow's onSignedOut): out of playback until they sign
+  // in (lib/playback-limits.js pluginStatusLimits). Not saved: a restart
+  // reads the status afresh.
+  const [pluginsSignedOut, setPluginsSignedOut] = useState([]);
 
   // Track main content width for responsive layouts
   const [mainContentWidth, setMainContentWidth] = useState(800);
@@ -3648,6 +3663,9 @@ const Parachord = () => {
   // The latest collection album opener, for an album page's Try again: the
   // retry is stored on the page and must not call a render's stale closure.
   const handleCollectionAlbumClickRef = useRef(null);
+  // The save behind a recommended playlist's "Save to Playlists" (#1659),
+  // read by the native menu's listener, which is registered once.
+  const saveServicePlaylistRef = useRef(null);
   // The release on screen now, for timers and async callbacks (the album
   // catalog race) that must not act on a stale closure.
   const currentReleaseRef = useRef(null);
@@ -3928,31 +3946,6 @@ const Parachord = () => {
   // Scrobbler settings state
   const [scrobblersInitialized, setScrobblersInitialized] = useState(false);
   const [scrobblerConfigs, setScrobblerConfigs] = useState({});
-  // Loved-tracks push (opt-in per service). See
-  // docs/plans/2026-05-03-loved-tracks-scrobbler-push-design.md.
-  const [scrobblerLovePushEnabled, setScrobblerLovePushEnabled] = useState({});
-  const scrobblerLovePushEnabledRef = useRef({});
-  const lovePushedKeysRef = useRef({}); // { [trackId]: { lastfm?: ts, listenbrainz?: ts | { at, mbid } } }
-  const [loveBackfillRunning, setLoveBackfillRunning] = useState({}); // { [service]: boolean }
-  const loveBackfillRunningRef = useRef({});
-  const [loveBackfillProgress, setLoveBackfillProgress] = useState({}); // { [service]: { done, total } }
-  // Loved-tracks IMPORT (parachord#1071): the inbound half of the
-  // loved-tracks scrobbler sync. One run per service, manual button in
-  // the scrobbler's card; the cursor makes later runs only fetch new loves.
-  const [loveImportRunning, setLoveImportRunning] = useState({}); // { [service]: boolean }
-  const loveImportRunningRef = useRef({});
-  const [loveImportProgress, setLoveImportProgress] = useState({}); // { [service]: { done, total, phase? } }
-  const loveImportCursorRef = useRef({}); // { [service]: loved-at seconds — newest seen }
-  // In-memory retry queue for love-pushes that failed transiently (mapper
-  // 5xx/502, LB API 5xx/429, network errors). Walked by a periodic runner
-  // that re-attempts pushLoveToScrobblers on each entry. Max 5 attempts,
-  // then drop with a warning log. Not persisted across restarts — that's
-  // a deliberate scope choice; the user can hit the backfill button to
-  // catch up after a long mapper outage. Entries are auto-removed when
-  // pushLoveToScrobblers succeeds for all enabled services on a given
-  // track. Map keyed by trackId so re-loving a track doesn't stack
-  // entries. parachord (Starting Line incident, 2026-06).
-  const loveRetryQueueRef = useRef(new Map()); // Map<trackId, { track, attempts }>
   const [scrobblingEnabled, setScrobblingEnabled] = useState(true);
 
   const [showUrlImportDialog, setShowUrlImportDialog] = useState(false);
@@ -5575,6 +5568,7 @@ const Parachord = () => {
   // from the engine's bridge block.
   const showToastRef = useRef(null);
   const showConfirmDialogRef = useRef(null);
+  const saveCollectionRef = useRef(null);
   const confirmAsyncRef = useRef(null);
   const enrichTrackWithMbidRef = useRef(null);
   const fetchArtworkViaMbidRef = useRef(null);
@@ -6236,8 +6230,12 @@ const Parachord = () => {
   // deleted).
   const playbackLimits = useMemo(() => ({
     applemusic: PlaybackLimits.appleMusicPlaybackLimit({ checked: appleMusicAuthChecked, connected: appleMusicConnected }),
-    ...PlaybackLimits.pluginStatusLimits(pluginStatuses)
-  }), [appleMusicAuthChecked, appleMusicConnected, pluginStatuses]);
+    // A signed-out plug-in (its status says so, or a play it refused did)
+    // leaves playback like a signed-out Apple Music (#1624).
+    ...PlaybackLimits.pluginStatusLimits(pluginStatuses, pluginName, pluginsSignedOut)
+  }), [appleMusicAuthChecked, appleMusicConnected, pluginStatuses, pluginsSignedOut]);
+  const playbackLimitsRef = useRef(playbackLimits);
+  playbackLimitsRef.current = playbackLimits;
   const planBlockedResolverIds = useMemo(() => PlaybackLimits.planBlockedIds(playbackLimits), [playbackLimits]);
   // Signed out for sync: the sync check's verdict, or the account's own
   // sign-in check. The sync check only runs when a sync does, so after a
@@ -6310,7 +6308,6 @@ const Parachord = () => {
   useEffect(() => { friendsRef.current = friends; }, [friends]);
   useEffect(() => { metaServiceConfigsRef.current = metaServiceConfigs; }, [metaServiceConfigs]);
   useEffect(() => { scrobblerConfigsRef.current = scrobblerConfigs; }, [scrobblerConfigs]);
-  useEffect(() => { scrobblerLovePushEnabledRef.current = scrobblerLovePushEnabled; }, [scrobblerLovePushEnabled]);
   useEffect(() => { collectionDataRef.current = collectionData; }, [collectionData]);
   // Scroll edge (index.html .scroll-edge): mark a page scroll area once it
   // has scrolled. Scroll events don't bubble, so one capture listener sees
@@ -7425,6 +7422,32 @@ const Parachord = () => {
   const [loadedResolvers, setLoadedResolvers] = useState([]);
   const loadedResolversRef = useRef([]);
 
+  // Loves: the loved-tracks push, its retry queue, the backfill and the
+  // import (hooks/use-loves.js, parachord#1487 "Scrobbling and Loves",
+  // #1559). Called here, after the Collection state, the loaded plug-ins and
+  // the plug-in config reader it reads (a plug-in's own loves, step 3).
+  const {
+    scrobblerLovePushEnabled, setScrobblerLovePushEnabled,
+    lovePushedKeysRef, loveImportCursorRef, loveRetryQueueRef,
+    loveBackfillRunning, loveBackfillProgress,
+    loveImportRunning, loveImportProgress,
+    pushLoveToScrobblers, setLovePushEnabled, runLoveBackfill, runLoveImport,
+  } = useLoves({
+    collectionDataRef,
+    collectionLoadingRef,
+    setCollectionData,
+    metaServicesRef,
+    loadedResolversRef,
+    getResolverConfigRef,
+    resolverSyncSettingsRef,
+    metaServiceConfigsRef,
+    scrobblerConfigsRef,
+    showSidebarBadge,
+    showToastRef,
+    showConfirmDialogRef,
+    saveCollectionRef,
+  });
+
   // Capability lookups for the shared HTML5 audio element. A resolver that
   // declares capabilities.html5Stream (with getStreamUrl in its .axe) plays an
   // http(s) URL through that element without the host naming it: Subsonic
@@ -7554,142 +7577,59 @@ const Parachord = () => {
   }, []);
 
 
-  // Sign in to Amazon Music inside Parachord. Playback uses the shared
-  // Widevine player and the CDM built into this Electron build; the session
-  // itself is the plugin's since #1356 M10 — the flow below is the renderer's
-  // prompt UX (the consent dialog, single-flight, the decline quiet, the
-  // hiccup retry) over the plugin's methods: getStatus (the CDM verdict and
-  // the signed-in fact), signInPromptDecision (the hiccup rule) and signIn
-  // (the visible window with the plugin's own decide rule). The desktop app
-  // is not launched. explicit:true always shows the dialog (play button,
-  // settings). explicit:false is the background-resolve prompt: one at a
-  // time, skipped during radio/auto-advance, and not repeated for 10 minutes
-  // after a decline. A second caller shares the in-flight promise so it
-  // cannot overwrite onResolve.
-  const manageAmazonMusic = async (opts = {}) => {
-    const loaded = resolverLoaderRef.current && typeof resolverLoaderRef.current.getResolver === 'function'
-      ? resolverLoaderRef.current.getResolver('amazonmusic')
-      : null;
-    // No prompt without the plugin (not loaded, or an old .axe with no
-    // session surface): the prompt IS the plugin's UX.
-    if (!loaded || typeof loaded.signIn !== 'function') return false;
-    const explicit = opts.explicit !== false;
-    if (!explicit && Date.now() < amazonManageDeclinedUntilRef.current) return false;
-    // Settings → Sign in passes explicit:true. Radio must not swallow that.
-    if (!explicit && (isAdvancingTrackRef.current || spinoffModeRef.current)) {
-      console.log('Skipping Amazon connect prompt during auto-advance');
-      return false;
-    }
-    if (!explicit && typeof document !== 'undefined' && document.hidden) return false;
-    if (amazonManageInFlightRef.current) return amazonManageInFlightRef.current;
-
-    let finishInFlight;
-    const inFlight = new Promise((resolve) => { finishInFlight = resolve; });
-    amazonManageInFlightRef.current = inFlight;
-
-    const run = (async () => {
-      // The plugin's status reply: the signed-in fact and this build's CDM
-      // verdict (the plugin's EME probe — the old host read died with the IPC
-      // status). Feeds the tile/settings row on the way by; a read that fails
-      // outright (the loader itself) is no verdict, like the old IPC catch.
-      const status = await refreshPluginStatus('amazonmusic').catch(() => null);
-      if (status && status.cdm === false) {
-        showToast('This Parachord build has no Widevine CDM, so Amazon Music cannot play.', 'error');
-        return false;
-      }
-      // A not-signed-in while the auth cookies say the session is live is
-      // usually Amazon's periodic session-token refresh catching a page load:
-      // retry quietly instead of prompting. Only a streak lasting a minute
-      // (most likely the profile picker) prompts. Settings' Sign in button
-      // passes forcePrompt and always gets the window. The rule is the
-      // plugin's (signInPromptDecision); an old .axe without the method
-      // prompts at once, the pre-#1172 behavior.
-      if (!opts.forcePrompt) {
-        const verdict = typeof loaded.signInPromptDecision === 'function'
-          ? loaded.signInPromptDecision({
-              reason: opts.reason,
-              cookiesSignedIn: !!(status && status.signedIn),
-              streak: amazonSignInHiccupRef.current,
-              now: Date.now()
-            })
-          : { prompt: true, streak: { firstAt: 0, lastAt: 0 } };
-        amazonSignInHiccupRef.current = verdict.streak;
-        if (!verdict.prompt) {
-          console.log('[Amazon] not signed in, but the session cookies are live: retrying quietly instead of prompting');
-          await new Promise(r => setTimeout(r, 2000));
-          return true;
-        }
-      }
-      const granted = await new Promise((resolve) => {
-        setAmazonManageDialog({ show: true, onResolve: resolve, relaunching: false });
-      });
-      if (!granted) {
-        amazonManageDeclinedUntilRef.current = Date.now() + 10 * 60 * 1000;
-        return false;
-      }
-      setAmazonManageDialog({ show: true, onResolve: null, relaunching: true });
-      const login = await loaded.signIn();
-      setAmazonManageDialog({ show: false, onResolve: null, relaunching: false });
-      refreshPluginStatus('amazonmusic');
-      if (login && login.signedIn) {
-        amazonSignInHiccupRef.current = { firstAt: 0, lastAt: 0 };
-        showToast('Signed in to Amazon Music', 'success');
-        if (typeof window.__parachordClearAmazonNoMatch === 'function') window.__parachordClearAmazonNoMatch();
-        return true;
-      }
-      // The sign-in window closed without a session: the same quiet period as
-      // declining the prompt. Without it the next background search's
-      // not-signed-in reopened the prompt at once, and again after every close.
-      amazonManageDeclinedUntilRef.current = Date.now() + 10 * 60 * 1000;
-      return false;
-    })().catch((error) => {
-      setAmazonManageDialog({ show: false, onResolve: null, relaunching: false });
-      console.error('Amazon Music sign-in failed:', error);
-      return false;
-    });
-
-    try {
-      const ok = await run;
-      finishInFlight(ok);
-      return ok;
-    } finally {
-      amazonManageInFlightRef.current = null;
-    }
-  };
-  window.__parachordManageAmazonMusic = manageAmazonMusic;
-
-  // The playback engine's "this plug-in needs sign-in" prompt (#1523): a play
-  // refused with reason 'not-signed-in' asks the plug-in that refused,
-  // routed by the registry, never by name. Only a plug-in on the status
-  // surface (capabilities.status) with a signIn method can be prompted. A
-  // plug-in whose sign-in carries host UX of its own runs that flow (Amazon's
-  // consent dialog, hiccup rule and CDM gate, manageAmazonMusic above, which
-  // the plug-in dialog's Sign in and connectPlugin also use); any other runs
-  // its own signIn() and reports whether it ended signed in.
-  const hostSignInFlows = { amazonmusic: manageAmazonMusic };
-  const promptablePlugin = (resolverId) => {
-    const plugin = resolverLoaderRef.current && typeof resolverLoaderRef.current.getResolver === 'function'
-      ? resolverLoaderRef.current.getResolver(resolverId)
-      : null;
-    return plugin && plugin.capabilities && plugin.capabilities.status && typeof plugin.signIn === 'function' ? plugin : null;
-  };
-  const promptPluginSignIn = async (resolverId, opts = {}) => {
-    const plugin = promptablePlugin(resolverId);
-    if (!plugin) return false;
-    const flow = hostSignInFlows[resolverId];
-    if (flow) return flow(opts);
-    try {
-      const login = await plugin.signIn();
-      return !!(login && login.signedIn);
-    } catch (error) {
-      console.error(`${plugin.name} sign-in failed:`, error);
-      return false;
-    } finally {
-      refreshPluginStatus(resolverId).catch(() => {});
-    }
-  };
-  promptPluginSignIn.canPrompt = (resolverId) => !!promptablePlugin(resolverId);
+  // The sign-in prompt for every plug-in on the status surface (#1624):
+  // lib/plugin-sign-in-flow.js, the one flow wherever a plug-in's sign-in
+  // starts. The playback engine's not-signed-in refusal (#1523, routed by
+  // the registry: one plug-in's refusal never opens another's sign-in), the
+  // plug-in dialog's Sign in, Home's Connect, and a plug-in's own search or
+  // import when it finds it's signed out. For any plug-in it gates background
+  // prompts (auto-advance, Spinoff, a hidden window, 10 minutes after a Not
+  // now), runs one prompt per plug-in at a time, says so when the build has
+  // no Widevine CDM (the plug-in's status reply), runs the plug-in's own
+  // hiccup rule when it has one (signInPromptDecision: Amazon's quiet retry
+  // over a session-token refresh, #1172), then asks "Sign in to X?" with the
+  // plug-in's own tip (settings.signInPromptHint) before its sign-in window opens.
+  // It was Amazon's alone (manageAmazonMusic), and another plug-in's window
+  // opened mid-play with no question first. Only a plug-in on the status
+  // surface with a signIn method is asked (canPrompt).
+  const promptPluginSignIn = (() => {
+    const flow = createPluginSignInFlow({
+      getPlugin: (id) => (resolverLoaderRef.current && typeof resolverLoaderRef.current.getResolver === 'function'
+        ? resolverLoaderRef.current.getResolver(id)
+        : null),
+      // The status reply feeds the tile and the settings row on the way by.
+      readStatus: (id) => refreshPluginStatus(id),
+      askConsent: (request) => new Promise((resolve) => {
+        setPluginSignInDialog({ show: true, ...request, signingIn: false, onResolve: resolve });
+      }),
+      showSigningIn: () => setPluginSignInDialog(prev => ({ ...prev, show: true, signingIn: true, onResolve: null })),
+      closeDialog: () => setPluginSignInDialog({ show: false }),
+      backgroundBlocked: () => !!(isAdvancingTrackRef.current || spinoffModeRef.current
+        || (typeof document !== 'undefined' && document.hidden)),
+      // Signed in: the plug-in's cached misses no longer hold (a search it
+      // refused while signed out was cached as found-nothing), and it plays
+      // again.
+      onSignedIn: (id) => {
+        setPluginsSignedOut(prev => (prev.includes(id) ? prev.filter(x => x !== id) : prev));
+        clearResolverMisses(id);
+      },
+      // A refusal that ended signed out: out of playback until it signs in.
+      onSignedOut: (id) => setPluginsSignedOut(prev => (prev.includes(id) ? prev : [...prev, id])),
+      showToast: (message, type) => showToast(message, type),
+    }, pluginSignInStateRef.current);
+    const prompt = (resolverId, opts) => flow.prompt(resolverId, opts);
+    prompt.canPrompt = flow.canPrompt;
+    // Out of playback because it's signed out, and this flow can sign it in:
+    // the playback engine asks for a track only it has.
+    prompt.isSignedOut = (resolverId) => PlaybackLimits.isSignedOutLimit(playbackLimitsRef.current[resolverId])
+      && flow.canPrompt(resolverId);
+    return prompt;
+  })();
   window.__parachordPromptPluginSignIn = promptPluginSignIn;
+  // Installed Amazon Music plug-ins ask through this name from their own
+  // search and playlist import (plugins-src/amazonmusic/implementation.js):
+  // the same flow, for that plug-in.
+  window.__parachordManageAmazonMusic = (opts) => promptPluginSignIn('amazonmusic', opts);
 
   // The generic plugin-status surface (capabilities.status, #1356): a plugin
   // that can report its sign-in/playback-limit state implements getStatus,
@@ -7707,7 +7647,7 @@ const Parachord = () => {
   // null; each is stored as-is — a failure is no verdict for the limit map
   // (lib/playback-limits.js pluginStatusLimit) and the honest error row
   // (pluginStatusRow), and a null (never asked) stays "Checking…".
-  // Returns the reply's promise (manageAmazonMusic reads it for the CDM gate),
+  // Returns the reply's promise (the sign-in flow reads it for the CDM gate),
   // so a caller can both await the verdict and let it feed the map.
   const refreshPluginStatus = (resolverId) => {
     const loader = resolverLoaderRef.current;
@@ -8058,7 +7998,6 @@ const Parachord = () => {
       return newData;
     });
   };
-  window.__parachordClearAmazonNoMatch = () => clearResolverMisses('amazonmusic');
 
   // A resolver whose plan stopped blocking it (an upgrade) and whose searches
   // were held back meanwhile (Amazon) searches again. Its last state is kept
@@ -8997,6 +8936,11 @@ const Parachord = () => {
           // The built-in pair, and the scrobbler reads its key and secret
           // from window.lastfmKeys from now on (lib/lastfm-key.js).
           window.lastfmKeys?.setBuiltin({ apiKey: config.lastfmApiKey, apiSecret: config.lastfmApiSecret });
+          // Last.fm's and ListenBrainz's loves, as love providers over their
+          // scrobblers (lib/love-providers.js, #1559). Before the init below:
+          // its failed-scrobble retry can take a while, and a heart in the
+          // meantime must still reach them.
+          registerBuiltInLoveProviders(window);
           await window.initializeScrobblers({ ...config, lastfmKeys: window.lastfmKeys });
           console.log('[App] Scrobblers initialized');
           setScrobblersInitialized(true);
@@ -10451,7 +10395,8 @@ const Parachord = () => {
   // pause: only `enabled` changes. Every other setting, the Collection's
   // syncSources and playlists' syncedFrom/syncedTo stay, and nothing calls the
   // service until it's back on (the background loop, the startup syncs, the
-  // love/unlove pushes and the N-way drive all check `enabled`). Removing what
+  // love/unlove pushes and the N-way drive all check `enabled`, and so do
+  // its loved-tracks pushes and Send, hooks/use-loves.js, #1445). Removing what
   // a service synced is Settings' Stop syncing, not this. On: a service with
   // saved choices resumes with them on the next background run; one never set
   // up opens the setup dialog instead.
@@ -13102,6 +13047,7 @@ ${trackListXml}
     };
   }, [allResolvers]);
 
+
   // Sync resolverOrder with activeResolvers - only active resolvers belong in
   // the priority order. Add any active resolvers that are missing, and remove
   // any that were disabled.
@@ -14203,14 +14149,12 @@ ${trackListXml}
     // src/renderer/lib/love-import.js), so a track loved on both services
     // and removed once stays removed from both imports.
     entries.push(...loveTombstoneEntries(track));
-    // A heart-added track's ListenBrainz push resolved a recording MBID it
-    // never wrote on the row; the mark kept it, so the removal tombstones the
-    // exact recording the service holds (the name key can miss when
-    // Parachord's names differ from MusicBrainz's).
-    const pushedMbid = lovePushedKeysRef.current?.[track.id]?.listenbrainz;
-    if (pushedMbid && typeof pushedMbid === 'object' && /^[a-f0-9-]{36}$/i.test(pushedMbid.mbid || '')) {
-      push('listenbrainz', pushedMbid.mbid);
-    }
+    // A heart-added track's push resolved a recording MBID it never wrote
+    // on the row (ListenBrainz's, today); the mark kept it, so the removal
+    // tombstones the exact recording the service holds (the name key can
+    // miss when Parachord's names differ from MusicBrainz's).
+    const pushedMbid = LoveImport.markedMbid(lovePushedKeysRef.current?.[track.id]);
+    if (pushedMbid) push(LoveImport.MBID_TOMBSTONE_BUCKET, pushedMbid);
     return entries;
   }, []);
 
@@ -14278,575 +14222,6 @@ ${trackListXml}
       console.warn('[love-push] error:', err?.message || err);
     });
   }, [saveCollection, showToast, showSidebarBadge, deriveTombstoneEntries]);
-
-  // Push a track's love to any service whose toggle is on. Idempotent
-  // via lovePushedKeysRef — if already pushed, skips silently. Persists
-  // checkpoints to electron-store immediately so backfill resumes
-  // correctly across restarts. Used by both the live-add path
-  // (addTrackToCollection above) and the manual backfill button.
-  const pushLoveToScrobblers = useCallback(async (track, { justAdded = false } = {}) => {
-    if (!track?.id) return;
-    // A re-push (the periodic retry runner) must confirm the track is still in
-    // the collection: a love landing on the service after the user removed the
-    // track is dated newer than the removal and would come straight back on
-    // the next import (issue #1071 review). The live add path skips this —
-    // the row is being added as the push starts.
-    if (!justAdded) {
-      const stillThere = (collectionDataRef.current?.tracks || []).some((t) => t && t.id === track.id);
-      if (!stillThere) {
-        loveRetryQueueRef.current.delete(track.id);
-        console.log(`[love-push] skip "${track.title}" — removed from the collection since the love was queued`);
-        return;
-      }
-    }
-    const enabled = scrobblerLovePushEnabledRef.current || {};
-    const pushed = lovePushedKeysRef.current[track.id] || {};
-    const tasks = [];
-
-    // Last.fm
-    if (enabled.lastfm && !pushed.lastfm && window.lastfmScrobbler) {
-      tasks.push((async () => {
-        try {
-          // Signed in is enough: "Scrobble to Last.fm" pauses scrobbling only.
-          if (!(await window.lastfmScrobbler.isSignedIn())) return;
-          await window.lastfmScrobbler.loveTrack({
-            artist: track.artist, title: track.title,
-            mbid: track.mbid && /^[a-f0-9-]{36}$/i.test(track.mbid) ? track.mbid : undefined,
-          });
-          await markLovePushed(track.id, 'lastfm');
-          console.log(`[love-push] LFM ✓ ${track.artist} – ${track.title}`);
-        } catch (err) {
-          console.warn(`[love-push] LFM failed for "${track.title}":`, err?.message || err);
-        }
-      })());
-    }
-
-    // ListenBrainz (needs MBID)
-    if (enabled.listenbrainz && !pushed.listenbrainz && window.listenbrainzScrobbler) {
-      tasks.push((async () => {
-        try {
-          if (!(await window.listenbrainzScrobbler.isSignedIn())) return;
-          const mbid = await window.resolveMbidForLove(track);
-          if (!mbid) {
-            console.log(`[love-push] LB skip "${track.title}" — no MBID`);
-            return;
-          }
-          await window.listenbrainzScrobbler.loveTrack({ ...track, mbid });
-          await markLovePushed(track.id, 'listenbrainz', mbid);
-          clearListenbrainzLoveTombstone(mbid);
-          console.log(`[love-push] LB ✓ ${track.artist} – ${track.title}`);
-        } catch (err) {
-          console.warn(`[love-push] LB failed for "${track.title}":`, err?.message || err);
-        }
-      })());
-    }
-
-    if (tasks.length > 0) await Promise.allSettled(tasks);
-
-    // After each push attempt, check whether the track is fully pushed for
-    // all enabled services. If anything is still pending (mapper down, LB
-    // 429, network error, no MBID match, etc.), queue for retry; the
-    // periodic retry runner below will re-attempt. If everything succeeded,
-    // remove from the queue so we don't pointlessly re-check.
-    // parachord (Starting Line incident, 2026-06).
-    const post = lovePushedKeysRef.current[track.id] || {};
-    const enabledNow = scrobblerLovePushEnabledRef.current || {};
-    const lfmPending = !!enabledNow.lastfm && !post.lastfm;
-    const lbPending = !!enabledNow.listenbrainz && !post.listenbrainz;
-    if (lfmPending || lbPending) {
-      const existing = loveRetryQueueRef.current.get(track.id);
-      const attempts = (existing?.attempts || 0) + 1;
-      const MAX_ATTEMPTS = 5;
-      if (attempts > MAX_ATTEMPTS) {
-        loveRetryQueueRef.current.delete(track.id);
-        const stillPending = [lfmPending && 'lastfm', lbPending && 'listenbrainz'].filter(Boolean).join(', ');
-        console.warn(`[love-push] giving up on "${track.artist} – ${track.title}" after ${MAX_ATTEMPTS} attempts (still pending: ${stillPending})`);
-      } else {
-        loveRetryQueueRef.current.set(track.id, { track, attempts });
-      }
-    } else if (loveRetryQueueRef.current.has(track.id)) {
-      // Fully pushed — drop from queue if it was there from a prior failure.
-      loveRetryQueueRef.current.delete(track.id);
-    }
-  }, []);
-
-  // Periodic retry runner for the love-push queue. Walks any tracks that
-  // failed to push fully last time, re-attempts via pushLoveToScrobblers
-  // (which is idempotent — already-pushed services short-circuit at the
-  // top via the lovePushedKeysRef check). 5-minute cadence is generous
-  // enough that a transient mapper outage rarely costs more than 5-10
-  // minutes of perceived staleness; combined with MAX_ATTEMPTS=5 in
-  // pushLoveToScrobblers above, total retry window per love is up to 25
-  // minutes. After that, the user can hit the manual backfill button to
-  // mop up. parachord (Starting Line incident, 2026-06).
-  useEffect(() => {
-    const RETRY_INTERVAL_MS = 5 * 60 * 1000;
-    const interval = setInterval(async () => {
-      if (loveRetryQueueRef.current.size === 0) return;
-      const entries = Array.from(loveRetryQueueRef.current.values());
-      console.log(`[love-retry] checking ${entries.length} queued love(s)`);
-      for (const { track } of entries) {
-        try {
-          await pushLoveToScrobblers(track);
-        } catch (err) {
-          console.warn(`[love-retry] retry threw for "${track.artist} – ${track.title}":`, err?.message || err);
-        }
-        // Soft pacing — don't burst the LB/mapper/MB APIs if the queue is
-        // large. 500ms gap is small relative to a 5-minute cadence.
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      }
-    }, RETRY_INTERVAL_MS);
-    return () => clearInterval(interval);
-    // pushLoveToScrobblers is stable (useCallback with empty deps), so
-    // this effect mounts once.
-  }, [pushLoveToScrobblers]);
-
-  // Persist a single love-pushed checkpoint. Keeps the ref hot and
-  // writes through to electron-store so a backfill mid-run survives
-  // a crash.
-  // A successful ListenBrainz push clears the tombstone its own MBID may
-  // have written on an earlier removal: a re-add after a removal must import
-  // again, and the mark's MBID is the tombstone key (parachord#1071 review).
-  const clearListenbrainzLoveTombstone = (mbid) => {
-    if (!mbid || !/^[a-f0-9-]{36}$/i.test(mbid) || !window.electron?.tombstones) return;
-    window.electron.tombstones.clearBatch([{ providerId: 'listenbrainz', externalId: mbid }])
-      .catch((err) => console.warn('[love-push] could not clear the ListenBrainz tombstone:', err?.message || err));
-  };
-
-  // markLovePushed(trackId, service, mbid): the entry is the push timestamp,
-  // or { at, mbid } when the push resolved a recording MBID (ListenBrainz) —
-  // storing it means a later removal can tombstone the exact recording the
-  // service holds, even though the collection row itself never carries it.
-  // Both shapes are truthy, so every "already pushed" check keeps working.
-  const markLovePushed = useCallback(async (trackId, service, mbid) => {
-    const stamped = (typeof mbid === 'string' && /^[a-f0-9-]{36}$/i.test(mbid))
-      ? { at: Date.now(), mbid }
-      : Date.now();
-    const next = {
-      ...lovePushedKeysRef.current,
-      [trackId]: { ...(lovePushedKeysRef.current[trackId] || {}), [service]: stamped },
-    };
-    lovePushedKeysRef.current = next;
-    try { await window.electron.store.set('love_pushed_keys', next); }
-    catch (e) { /* non-fatal: ref is still hot for this session */ }
-  }, []);
-
-  // Toggle the live-push setting for a service. No automatic backfill
-  // — the user has to click the backfill button explicitly.
-  const setLovePushEnabled = useCallback(async (service, enabled) => {
-    setScrobblerLovePushEnabled(prev => {
-      const next = { ...prev, [service]: !!enabled };
-      window.electron.store.set('scrobbler_love_push_enabled', next).catch(() => {});
-      return next;
-    });
-  }, []);
-
-  // Does this plug-in sync loved tracks? Its manifest's `lovedTracks`
-  // capability (Last.fm, ListenBrainz), read from the loaded meta-services.
-  const serviceHasLovedTracks = (service) =>
-    !!(metaServicesRef.current || []).find(s => s.id === service)?.capabilities?.lovedTracks;
-
-  // Manual backfill: walks the collection, pushes any track not yet
-  // marked as pushed for this service. Soft rate-limit ~1 req/sec.
-  // Idempotency cache means re-clicks are cheap.
-  // { onlyIds } restricts the walk to those ids — the love-import's
-  // confirmed cross-service push (parachord#1071): only what was just
-  // imported goes to the other service, never the user's older unpushed
-  // tracks, and never a per-track live push (which would flood the retry
-  // queue when MBIDs can't resolve).
-  const runLoveBackfill = useCallback(async (service, { onlyIds } = {}) => {
-    if (loveBackfillRunningRef.current[service]) return;
-    // A plug-in that declares `lovedTracks` (was two hard-coded names).
-    if (!serviceHasLovedTracks(service)) return;
-    const scrobbler = service === 'lastfm' ? window.lastfmScrobbler : window.listenbrainzScrobbler;
-    if (!scrobbler) { showToast(`${service} scrobbler not loaded`); return; }
-    // Signed in is enough: the scrobbling switch doesn't stop loved tracks.
-    if (!(await scrobbler.isSignedIn())) { showToast(`Sign in to ${scrobbler.name} to sync loved tracks`); return; }
-
-    const tracks = (collectionDataRef.current?.tracks || []);
-    const todo = tracks.filter(t => !lovePushedKeysRef.current[t.id]?.[service] && (!onlyIds || onlyIds.has(t.id)));
-    if (todo.length === 0) {
-      if (!onlyIds) showToast(`Already up to date: no loves to push to ${pluginName(service)}`);
-      return;
-    }
-
-    loveBackfillRunningRef.current = { ...loveBackfillRunningRef.current, [service]: true };
-    setLoveBackfillRunning(prev => ({ ...prev, [service]: true }));
-    setLoveBackfillProgress(prev => ({ ...prev, [service]: { done: 0, total: todo.length } }));
-
-    let pushed = 0, skipped = 0, failed = 0, removedMidRun = 0;
-    for (let i = 0; i < todo.length; i++) {
-      const track = todo[i];
-      // The todo list is a snapshot: a track removed since the walk started
-      // must not get its love pushed after the removal (parachord#1071 review).
-      const stillThere = (collectionDataRef.current?.tracks || []).some((t) => t && t.id === track.id);
-      if (!stillThere) { removedMidRun++; continue; }
-      try {
-        if (service === 'lastfm') {
-          await window.lastfmScrobbler.loveTrack({
-            artist: track.artist, title: track.title,
-            mbid: track.mbid && /^[a-f0-9-]{36}$/i.test(track.mbid) ? track.mbid : undefined,
-          });
-          await markLovePushed(track.id, 'lastfm');
-          pushed++;
-        } else {
-          const mbid = await window.resolveMbidForLove(track);
-          if (!mbid) { skipped++; continue; }
-          await window.listenbrainzScrobbler.loveTrack({ ...track, mbid });
-          await markLovePushed(track.id, 'listenbrainz', mbid);
-          clearListenbrainzLoveTombstone(mbid);
-          pushed++;
-        }
-      } catch (err) {
-        console.warn(`[love-backfill ${service}] failed for "${track.title}":`, err?.message || err);
-        failed++;
-      }
-      setLoveBackfillProgress(prev => ({ ...prev, [service]: { done: i + 1, total: todo.length } }));
-      // Soft rate-limit so we don't hammer the API
-      await new Promise(r => setTimeout(r, 1000));
-    }
-
-    loveBackfillRunningRef.current = { ...loveBackfillRunningRef.current, [service]: false };
-    setLoveBackfillRunning(prev => ({ ...prev, [service]: false }));
-    setLoveBackfillProgress(prev => ({ ...prev, [service]: null }));
-
-    const label = pluginName(service);
-    let msg = `Backfilled ${pushed} love${pushed === 1 ? '' : 's'} to ${label}`;
-    if (skipped > 0) msg += ` (${skipped} skipped: no MBID)`;
-    if (removedMidRun > 0) msg += ` (${removedMidRun} removed during the run)`;
-    if (failed > 0) msg += ` (${failed} failed)`;
-    showToast(msg);
-  }, [showToast, markLovePushed]);
-
-  // ── Loved-tracks IMPORT (parachord#1071) ──────────────────────────────
-  // Pulls the user's loves from a scrobbler service into the collection —
-  // the inbound half of the loved-tracks sync. Plan:
-  // docs/plans/2026-11-06-import-loved-tracks.md. Rules:
-  //   1. No loop: added AND matched rows are marked in love_pushed_keys for
-  //      the service the loves came FROM, so the push toggle and the
-  //      backfill never send a love straight back to its origin.
-  //   2. Cross-service propagation is explicit AND confirmed: when the other
-  //      service's push toggle is on and it's actually connected, a dialog
-  //      says so up front; the imported ids then go to the other service
-  //      through a RESTRICTED backfill (onlyIds), never a per-track live
-  //      push (a resolver outage would flood the retry queue and hammer the
-  //      mapper in parallel).
-  //   3. Identity dedupe, not id: recording MBID, then the normalized name
-  //      (planLoveImport). Last.fm's mbid is ignored (stale); non-Latin
-  //      loves get trackSlug ids so 宇多田ヒカル/光 and 宇多田ヒカル/First Love
-  //      are two rows, not one `--noalbum`.
-  //   4. Tombstones: one provider ('love-import', name key) written on every
-  //      removal and checked for both services, plus the recording-MBID
-  //      entry. A love NEWER than the removal gets through, and a removal
-  //      during the run is honored before each write.
-  //   5. addedAt keeps the service's loved-at time.
-  //   6. One-way stays one-way: importing never unloves anything remotely.
-
-  const runLoveImport = useCallback(async (service) => {
-    if (!serviceHasLovedTracks(service)) return;
-    if (loveImportRunningRef.current[service]) return;
-    const label = pluginName(service);
-    const otherService = service === 'lastfm' ? 'listenbrainz' : 'lastfm';
-    const otherLabel = pluginName(otherService);
-    // A not-yet-loaded collection reads as empty: the dedupe would add
-    // every love as new. Same guard class as saveCollection (#758).
-    if (collectionLoadingRef.current) {
-      showToast('Your Collection is still loading. Try the import again in a moment.', 'info');
-      return;
-    }
-    const scrobbler = service === 'lastfm' ? window.lastfmScrobbler : window.listenbrainzScrobbler;
-    if (!scrobbler) { showToast(`${label} scrobbler not loaded`, 'error'); return; }
-    // Take the running flag synchronously, before any await: a fast second
-    // click must not pass the guard while the first run sits between awaits
-    // (the updater re-check already prevents duplicate rows; this stops the
-    // doubled counts).
-    loveImportRunningRef.current = { ...loveImportRunningRef.current, [service]: true };
-    setLoveImportRunning(prev => ({ ...prev, [service]: true }));
-    setLoveImportProgress(prev => ({ ...prev, [service]: { done: 0, total: 0 } }));
-    try {
-      // Whose loves: the scrobbling sign-in's username, else the plug-in
-      // account's. Both services publish a user's loves by username, so the
-      // import needs no sign-in (it showed only while scrobbling was signed
-      // in, and Last.fm's import went missing with it, 2026-11-23).
-      const username = scrobblerConfigsRef.current?.[service]?.username || metaServiceConfigsRef.current?.[service]?.username;
-      if (!username) { showToast(`Add your ${label} username first`, 'error'); return; }
-
-      // Cross-service propagation, confirmed up front (issue #1071 rule 2).
-      // Connected, not just toggled — the dialog must not promise pushes a
-      // disconnected service can't make. Cancel (the button or the backdrop)
-      // stops the run.
-      let crossConfirm = false;
-      const otherScrobbler = otherService === 'lastfm' ? window.lastfmScrobbler : window.listenbrainzScrobbler;
-      if (scrobblerLovePushEnabledRef.current?.[otherService] && otherScrobbler) {
-        let otherConnected = false;
-        try { otherConnected = await otherScrobbler.isSignedIn(); } catch (e) { otherConnected = false; }
-        if (otherConnected) {
-          setLoveImportProgress(prev => ({ ...prev, [service]: { done: 0, total: 0, phase: 'confirm' } }));
-          crossConfirm = await new Promise((resolve) => {
-            showConfirmDialog({
-              type: 'info',
-              title: 'Import loved tracks',
-              message: `Tracks you import from ${label} will also be loved on ${otherLabel}, because "Push loves to ${otherLabel}" is on. This can't be undone from Parachord.`,
-              confirmLabel: 'Import',
-              onConfirm: () => resolve(true),
-              onCancel: () => resolve(false),
-            });
-          });
-          if (!crossConfirm) return;
-        }
-      }
-
-      const cursor = loveImportCursorRef.current?.[service] || 0; // loved-at seconds
-      const setProgress = (done, total, phase) =>
-        setLoveImportProgress(prev => ({ ...prev, [service]: { done, total, ...(phase ? { phase } : {}) } }));
-
-      // 1. Fetch: only loves newer than the cursor (collectLoves owns the
-      //    paging, the per-page retries and the stop rules).
-      const fetchPage = service === 'lastfm'
-        ? async ({ page, count }) => window.lastfmScrobbler.getLovedTracksPage({ page, count, username })
-        : async ({ offset, count }) => window.listenbrainzScrobbler.getLovedTracksPage({ offset, count, username });
-      const { loves, skipped, complete, error, capped } = await LoveImport.collectLoves({
-        fetchPage,
-        parse: service === 'lastfm' ? LoveImport.parseLastfmLovedPage : LoveImport.parseListenbrainzFeedbackPage,
-        cursor,
-        pageSize: service === 'lastfm' ? 200 : 100,
-        onProgress: (done, total) => setProgress(done, total),
-      });
-      if (error && loves.length === 0 && skipped === 0) {
-        if (error === 'Not connected') showToast(`Add your ${label} username first`, 'error');
-        else showToast(`Couldn't import from ${label}: ${error}`, 'error');
-        return;
-      }
-      if (loves.length === 0 && !error) {
-        showToast(cursor > 0 ? `No new loved tracks on ${label}` : `No loved tracks found on ${label}`);
-        return;
-      }
-
-      // 2. The tombstone list is load-bearing: importing without it could
-      //    bring removed tracks back, so a failed read stops the run.
-      let tombstones = {};
-      try { tombstones = await window.electron.tombstones.list(); }
-      catch (e) {
-        showToast(`Couldn't read your removed-tracks list, so nothing was imported: ${e?.message || e}`, 'error');
-        return;
-      }
-
-      const collectionTracks = collectionDataRef.current?.tracks || [];
-      // Removals from before this feature shipped have no tombstone. A mark
-      // in love_pushed_keys whose id is no longer in the collection was a
-      // Parachord love the user later removed, so it counts as removed.
-      const collectionIds = new Set(collectionTracks.map((t) => t && t.id).filter(Boolean));
-      const orphanPushedIds = new Set(
-        Object.keys(lovePushedKeysRef.current || {}).filter((id) => !collectionIds.has(id)));
-
-      const dropRemoved = async (plan) => {
-        // A removal during the run (the LB name-lookup tail can run for
-        // minutes) must not be undone by this write — re-read and re-check.
-        // A mid-run re-read failure falls back to the start-of-run snapshot;
-        // the gating read in step 2 already stopped the run when the list
-        // couldn't be read at all.
-        let now = tombstones;
-        try { now = await window.electron.tombstones.list(); } catch (e) { /* keep the snapshot */ }
-        // One predicate drives both the count and the filter, so the summary
-        // can't drift from what was dropped. The pre-ship heuristic ONLY
-        // applies where no tombstone entry exists at all: a removed-then-
-        // re-loved track HAS one, and the date rule governs it.
-        const removed = (row) => {
-          const love = { service, artist: row.artist, title: row.title, mbid: row.mbid, lovedAt: row.addedAt / 1000 };
-          if (LoveImport.isLoveTombstoned(now, love)) return true;
-          return LoveImport.isOrphanedLovePush(orphanPushedIds, row) && LoveImport.loveTombstoneAt(now, love) == null;
-        };
-        plan.tombstoned += plan.add.filter(removed).length;
-        plan.add = plan.add.filter((row) => !removed(row));
-        return plan;
-      };
-
-      // 3. Plan and commit: rows with names land immediately; the
-      //    metadata-less lookup tail commits as a second batch, so quitting
-      //    during a long tail keeps the loves that never needed a lookup.
-      // One batch per commit, each with its own updater flag and saves, so
-      // a later batch can't read as confirmed off an earlier one's updater
-      // run. A batch's marks are written when IT confirms (a quit during
-      // the LB lookup tail must not leave batch 1 unmarked — Backfill would
-      // re-offer those loves to the service they came from).
-      const batches = [];
-      const commitBatch = (plan) => {
-        const batch = { planned: plan.add.length, updaterRan: false, savePromises: [], addedIds: [], saveOk: true };
-        batches.push(batch);
-        if (plan.add.length === 0) return batch;
-        setCollectionData(prev => {
-          batch.updaterRan = true;
-          const prevIds = new Set(prev.tracks.map((t) => t && t.id).filter(Boolean));
-          const fresh = plan.add.filter((r) => !prevIds.has(r.id));
-          if (fresh.length === 0) return prev; // everything appeared concurrently; nothing to save
-          const newData = { ...prev, tracks: [...prev.tracks, ...fresh] };
-          batch.savePromises.push(saveCollection(newData));
-          batch.addedIds.push(...fresh.map((r) => r.id));
-          return newData;
-        });
-        return batch;
-      };
-      const writeMarks = async (ids) => {
-        if (ids.length === 0) return;
-        const marked = LoveImport.withLovesPushed(lovePushedKeysRef.current, ids, service);
-        lovePushedKeysRef.current = marked;
-        try { await window.electron.store.set('love_pushed_keys', marked); }
-        catch (e) { console.warn(`[love-import ${service}] could not persist no-loop marks:`, e?.message || e); }
-      };
-      // Confirm a batch and mark its rows. Matched ids are already in the
-      // collection, so their marks are safe whatever the save did; added ids
-      // wait for THIS batch's confirmed save — a mark on a row a failed save
-      // never wrote would, after a restart, read as "you removed this"
-      // through the pre-ship heuristic and lose the love for good. A matched
-      // id can name an earlier batch's planned-but-unsaved row (plan2 matches
-      // plan1.add): marking that would orphan it the same way, so only ids
-      // that were in the collection when the run started, or that an earlier
-      // batch CONFIRMED, are marked. The setTimeout yield lets React commit
-      // the updater before its save promises are read (MessageChannel
-      // flushes ahead of timers).
-      const confirmBatch = async (batch, matchedIds) => {
-        const markableIds = new Set(collectionIds);
-        for (const b of batches) {
-          if (b === batch) break;
-          if (b.saveOk) for (const id of b.addedIds) markableIds.add(id);
-        }
-        await writeMarks(matchedIds.filter((id) => markableIds.has(id)));
-        await new Promise((r) => setTimeout(r, 0));
-        if (batch.planned > 0) {
-          if (!batch.updaterRan) batch.saveOk = false;
-          else if (batch.savePromises.length > 0) batch.saveOk = (await Promise.all(batch.savePromises)).every(Boolean);
-        }
-        if (batch.saveOk) await writeMarks(batch.addedIds);
-        return batch.saveOk;
-      };
-
-      // The MBIDs a heart's ListenBrainz push resolved and stored on its
-      // mark: indexed alongside the rows' own MBIDs so a love for that MBID
-      // matches the hearted row instead of duplicating it. Marks from before
-      // this shipped are plain timestamps and contribute nothing.
-      const markMbids = {};
-      for (const [id, entry] of Object.entries(lovePushedKeysRef.current || {})) {
-        const stamped = entry && entry.listenbrainz;
-        if (stamped && typeof stamped === 'object' && /^[a-f0-9-]{36}$/i.test(stamped.mbid || '')) {
-          markMbids[id] = stamped.mbid;
-        }
-      }
-
-      const namedLoves = loves.filter((l) => !l.needsLookup);
-      const needsLookupLoves = loves.filter((l) => l.needsLookup);
-      const plan1 = await dropRemoved(LoveImport.planLoveImport(namedLoves, collectionTracks, tombstones, markMbids));
-      const batch1 = commitBatch(plan1);
-      await confirmBatch(batch1, plan1.matchedIds);
-
-      // 4. The lookup tail (ListenBrainz's metadata-less loves; none for
-      //    Last.fm). One MB request each, on the background lane; a removed
-      //    love is checked FIRST against the start-of-run snapshot (its MBID
-      //    is all the tombstone key needs, so no 1.1s request is spent on a
-      //    love that will drop, and a transient lookup failure can't hold
-      //    the cursor for it; a removal DURING the run still costs one
-      //    lookup before dropRemoved's re-read drops it at the write); a row
-      //    already in the collection by MBID matches without the request; a
-      //    transient MusicBrainz failure holds the cursor (the love isn't
-      //    lost, just not this run) while a real miss is skipped.
-      let lookupTransient = 0, lookupSkipped = 0, lookupRemoved = 0;
-      const lookupMatchedIds = [];
-      const resolvedLoves = [];
-      if (needsLookupLoves.length > 0 && typeof window.lookupRecordingTitle === 'function') {
-        const mbidIndex = LoveImport.rowMbidIndex([...collectionTracks, ...plan1.add], markMbids);
-        setProgress(0, needsLookupLoves.length, 'lookup');
-        for (let i = 0; i < needsLookupLoves.length; i++) {
-          const cand = needsLookupLoves[i];
-          if (LoveImport.isLoveTombstoned(tombstones, cand)) { lookupRemoved++; continue; }
-          const existing = mbidIndex.get(cand.mbid);
-          if (existing) { lookupMatchedIds.push(existing.id); }
-          else {
-            const result = await window.lookupRecordingTitle(cand.mbid);
-            if (result?.status === 'ok') {
-              resolvedLoves.push({ ...cand, artist: result.artist, title: result.title, album: result.album || '', mbid: result.mbid || cand.mbid, needsLookup: undefined });
-            } else if (result?.status === 'transient') { lookupTransient++; }
-            else { lookupSkipped++; }
-          }
-          setProgress(i + 1, needsLookupLoves.length, 'lookup');
-        }
-      } else if (needsLookupLoves.length > 0) {
-        lookupSkipped += needsLookupLoves.length;
-      }
-      const plan2 = await dropRemoved(LoveImport.planLoveImport(resolvedLoves, [...collectionTracks, ...plan1.add], tombstones, markMbids));
-      const batch2 = commitBatch(plan2);
-      await confirmBatch(batch2, [...plan2.matchedIds, ...lookupMatchedIds]);
-
-      // 5. Roll up the batches (each already confirmed and marked in
-      //    confirmBatch above): the cursor moves only when every batch
-      //    confirmed its write; the summary counts what actually landed; the
-      //    cross-service push carries only the confirmed ids.
-      const saveOk = batches.every((b) => b.saveOk);
-      const plannedRows = batches.reduce((n, b) => n + b.planned, 0);
-      const addedIds = batches.reduce((acc, b) => acc.concat(b.addedIds), []);
-      const confirmedIds = batches.reduce((acc, b) => (b.saveOk ? acc.concat(b.addedIds) : acc), []);
-      const anyUpdaterRan = batches.some((b) => b.updaterRan);
-      const added = addedIds.length > 0 || plannedRows === 0 ? addedIds.length : (anyUpdaterRan ? addedIds.length : plannedRows);
-      if (added > 0) showSidebarBadge('collection');
-      // Two loves that match the same collection row are ONE mark but TWO
-      // loves: the summary counts loves, so it adds up to what the service
-      // returned.
-      const matchedLoves = plan1.matchedIds.length + plan2.matchedIds.length + lookupMatchedIds.length;
-
-      // 7. The cursor advances only when the whole window was read, nothing
-      //    transient failed, and the save landed — otherwise the next run
-      //    re-walks and self-heals instead of losing those loves forever.
-      const nextCursor = (complete && saveOk && lookupTransient === 0)
-        ? LoveImport.nextLoveCursor(cursor, loves, true)
-        : cursor;
-      if (nextCursor > cursor) {
-        loveImportCursorRef.current = { ...(loveImportCursorRef.current || {}), [service]: nextCursor };
-        window.electron.store.set('love_import_cursor', loveImportCursorRef.current).catch(() => {});
-      }
-
-      // 8. The summary. Rows the plan merged into one count as
-      //    "already in your collection" — the summary must add up to what
-      //    the service shows.
-      const matched = matchedLoves + plan1.merged + plan2.merged;
-      const tombstoned = plan1.tombstoned + plan2.tombstoned + lookupRemoved;
-      const allSkipped = skipped + lookupSkipped;
-      let msg = `Imported ${added} from ${label}. ${matched} already in your collection, ${allSkipped} skipped`;
-      if (tombstoned > 0) msg += `, ${tombstoned} you removed`;
-      if (capped) msg += '. Stopped at the import page cap, so older loves were left out';
-      if (lookupTransient > 0) msg += `. Couldn't reach MusicBrainz for ${lookupTransient} of them; run the import again`;
-      if (!saveOk) {
-        // Without a restart the rows are already in memory, so a re-run
-        // matches them and the confirmed cross-service push never fires —
-        // say how to push them anyway.
-        msg += `. Saving the library failed; run the import again after a restart${crossConfirm ? `, or send the imported loves from ${otherLabel}'s settings` : ''}`;
-      }
-      if (!complete && error) {
-        showToast(`Imported ${added} from ${label}, then stopped: ${error}. Run it again to pick up the rest.`, 'error', null, { duration: 8000 });
-      } else {
-        showToast(msg, saveOk ? 'success' : 'error', null, { duration: 8000 });
-      }
-
-      // 9. Cross-service propagation, confirmed in the pre-run dialog: just
-      //    the imported ids, through the restricted backfill (its own
-      //    progress on the other card), never a per-track live push.
-      if (crossConfirm && confirmedIds.length > 0) {
-        // The restricted backfill is a no-op while that service's own backfill
-        // is running — say so instead of silently skipping the confirmed push.
-        if (loveBackfillRunningRef.current[otherService]) {
-          showToast(`A ${otherLabel} backfill is still running. Once it finishes, send the ${countOf(confirmedIds.length, 'imported love')} from ${otherLabel}'s settings.`, 'info');
-        } else {
-          runLoveBackfill(otherService, { onlyIds: new Set(confirmedIds) }).catch((err) => {
-            console.warn(`[love-import ${service}] cross-service push failed:`, err?.message || err);
-          });
-        }
-      }
-    } catch (err) {
-      console.warn(`[love-import ${service}] failed:`, err?.message || err);
-      showToast(`Couldn't import from ${label}: ${err?.message || err}`, 'error');
-    } finally {
-      loveImportRunningRef.current = { ...loveImportRunningRef.current, [service]: false };
-      setLoveImportRunning(prev => ({ ...prev, [service]: false }));
-      setLoveImportProgress(prev => ({ ...prev, [service]: null }));
-    }
-  }, [showToast, showSidebarBadge, showConfirmDialog, saveCollection, runLoveBackfill]);
 
   // Remove track from collection
   const removeTrackFromCollection = useCallback((track) => {
@@ -15356,6 +14731,9 @@ ${trackListXml}
               lastModified: Date.now()
             }));
           }
+        } else if (data.action === 'save-service-playlist' && data.url) {
+          // A recommended playlist's "Save to Playlists" (#1659).
+          if (saveServicePlaylistRef.current) saveServicePlaylistRef.current({ url: data.url, name: data.name, coverArt: data.coverArt });
         } else if (data.action === 'export-playlist' && data.playlistId) {
           // Read via playlistsRef for the same stale-closure reason as delete below.
           const playlistToExport = (playlistsRef.current || []).find(p => p.id === data.playlistId);
@@ -16567,6 +15945,7 @@ ${trackListXml}
   useEffect(() => { updateSchedulerVisibilityRef.current = updateSchedulerVisibility; });
   useEffect(() => { showToastRef.current = showToast; });
   useEffect(() => { showConfirmDialogRef.current = showConfirmDialog; });
+  useEffect(() => { saveCollectionRef.current = saveCollection; });
   useEffect(() => { confirmAsyncRef.current = confirmAsync; });
   useEffect(() => { enrichTrackWithMbidRef.current = enrichTrackWithMbid; });
   useEffect(() => { fetchArtworkViaMbidRef.current = fetchArtworkViaMbid; });
@@ -19490,14 +18869,12 @@ ${trackListXml}
           } else if (savedLastView.view === 'playlist-view' && savedLastView.playlistId) {
             // Restore playlist detail view - need to find the playlist by ID
             setActiveView('playlist-view');
-            // Use different view history for ephemeral playlists (e.g., Weekly Jams from home)
-            if (savedLastView.isHistoryMix || (savedLastView.isEphemeral && savedLastView.playlistSource === 'listenbrainz')) {
-              setViewHistory(['home', 'playlist-view']);
-            } else {
-              setViewHistory(['library', 'playlists', 'playlist-view']);
-            }
-            // Store pending playlist load - will be processed once playlists are loaded
-            // For ephemeral ListenBrainz playlists, include extra info for reconstruction
+            // Back goes to Home for a history mix, Recommendations for any
+            // other unsaved playlist, Playlists for a saved one.
+            setViewHistory(restoreViewHistory(savedLastView));
+            // Store pending playlist load - processed once the playlists (a
+            // saved one), Home's weekly rows (a weekly one) or the plug-ins (one
+            // rebuilt from its link) are loaded (lib/ephemeral-playlist-restore.js).
             setPendingPlaylistLoad({
               id: savedLastView.playlistId,
               title: savedLastView.playlistTitle,
@@ -19505,7 +18882,11 @@ ${trackListXml}
               isHistoryMix: savedLastView.isHistoryMix,
               source: savedLastView.playlistSource,
               listenbrainzId: savedLastView.listenbrainzId,
-              weekLabel: savedLastView.weekLabel
+              weekLabel: savedLastView.weekLabel,
+              sourceUrl: savedLastView.sourceUrl,
+              creator: savedLastView.playlistCreator,
+              description: savedLastView.description,
+              coverArt: savedLastView.coverArt
             });
             console.log(`📦 Restoring last view: playlist-view (${savedLastView.playlistTitle})${savedLastView.isEphemeral ? ' [ephemeral]' : ''}`);
           } else if (savedLastView.view === 'discover') {
@@ -20140,21 +19521,13 @@ ${trackListXml}
       viewData.collectionTab = collectionTab;
     }
     if (activeView === 'playlist-view' && selectedPlaylist) {
-      viewData.playlistId = selectedPlaylist.id;
-      viewData.playlistTitle = selectedPlaylist.title;
-      // Save extra info for ephemeral playlists so they can be reconstructed
-      if (selectedPlaylist.isEphemeral) {
-        viewData.isEphemeral = true;
-        viewData.playlistSource = selectedPlaylist.source;
-        // A history mix lives on Home, so a relaunch falls back there.
-        const mixProviders = (historyMixesCache.current && historyMixesCache.current.providers) || {};
-        viewData.isHistoryMix = Object.values(mixProviders).some((entry) =>
-          entry && Array.isArray(entry.items) && entry.items.some((m) => `${entry.resolverId}-rec-${m.id}` === selectedPlaylist.id));
-        if (selectedPlaylist.listenbrainzId) {
-          viewData.listenbrainzId = selectedPlaylist.listenbrainzId;
-          viewData.weekLabel = selectedPlaylist.weekLabel;
-        }
-      }
+      // An unsaved playlist saves what rebuilds it: its weekly id, or its
+      // link and what the view showed (lib/ephemeral-playlist-restore.js,
+      // #1519). A history mix lives on Home, so Back goes there.
+      const mixProviders = (historyMixesCache.current && historyMixesCache.current.providers) || {};
+      const isHistoryMix = !!selectedPlaylist.isEphemeral && Object.values(mixProviders).some((entry) =>
+        entry && Array.isArray(entry.items) && entry.items.some((m) => `${entry.resolverId}-rec-${m.id}` === selectedPlaylist.id));
+      Object.assign(viewData, lastViewPlaylistFields(selectedPlaylist, { isHistoryMix }));
     }
     if (activeView === 'friendHistory' && currentFriend) {
       viewData.friendId = currentFriend.id;
@@ -20213,70 +19586,76 @@ ${trackListXml}
     }
   }, [currentArtist]);
 
-  // Load pending playlist once playlists are loaded
+  // Load pending playlist once what it needs is loaded (#1519: no plug-in
+  // named, lib/ephemeral-playlist-restore.js).
   useEffect(() => {
-    if (pendingPlaylistLoad) {
-      // For ephemeral ListenBrainz playlists (Weekly Jams/Exploration), look in homeData
-      if (pendingPlaylistLoad.isEphemeral && pendingPlaylistLoad.source === 'listenbrainz' && pendingPlaylistLoad.listenbrainzId) {
-        const jam = homeData.weeklyJams?.find(j => j.id === pendingPlaylistLoad.listenbrainzId)
-          || homeData.weeklyExploration?.find(j => j.id === pendingPlaylistLoad.listenbrainzId);
-        if (jam) {
-          console.log(`📦 Reconstructing ephemeral playlist for restored view: ${jam.title}`);
-          setPendingPlaylistLoad(null);
-          // Reconstruct the ephemeral playlist object
-          const ephemeralPlaylist = {
-            id: `listenbrainz-${jam.id}`,
-            listenbrainzId: jam.id,
-            title: jam.title,
-            weekLabel: jam.weekLabel,
-            date: jam.date || null,
-            description: jam.description,
-            tracks: jam.tracks || [],
-            tracksLoaded: jam.tracksLoaded,
-            isExternal: true,
-            isEphemeral: true,
-            source: 'listenbrainz',
-            creator: 'ListenBrainz'
-          };
-          loadPlaylist(ephemeralPlaylist, { skipNavigation: true });
-          return;
-        }
-        // Weekly playlists not loaded yet - wait for them
-        return;
-      }
-
-      // For regular playlists, look in playlists array
-      const playlist = playlists.find(p => p.id === pendingPlaylistLoad.id);
-      if (playlist) {
-        console.log(`📦 Loading playlist for restored view: ${playlist.title}`);
-        setPendingPlaylistLoad(null); // Clear only when found
-        // Use loadPlaylist to properly parse XSPF and populate playlistTracks
-        // Skip navigation since we already set activeView to 'playlist-view'
-        loadPlaylist(playlist, { skipNavigation: true });
-      }
-      // Don't clear pending or fall back yet - hosted playlists may still be loading
+    if (!pendingPlaylistLoad) return;
+    const kind = restoreKind(pendingPlaylistLoad);
+    // A weekly playlist, in Home's weekly rows by its weekly id, whatever
+    // plug-in sent it. Waits for the rows.
+    if (kind === 'weekly') {
+      const jam = homeData.weeklyJams?.find(j => j.id === pendingPlaylistLoad.listenbrainzId)
+        || homeData.weeklyExploration?.find(j => j.id === pendingPlaylistLoad.listenbrainzId);
+      if (!jam) return;
+      console.log(`📦 Reconstructing ephemeral playlist for restored view: ${jam.title}`);
+      setPendingPlaylistLoad(null);
+      const source = pendingPlaylistLoad.source || null;
+      loadPlaylist({
+        id: pendingPlaylistLoad.id || `${source}-${jam.id}`,
+        listenbrainzId: jam.id,
+        title: jam.title,
+        weekLabel: jam.weekLabel,
+        date: jam.date || null,
+        description: jam.description,
+        tracks: jam.tracks || [],
+        tracksLoaded: jam.tracksLoaded,
+        isExternal: true,
+        isEphemeral: true,
+        source,
+        creator: source ? pluginName(source) : null
+      }, { skipNavigation: true });
+      return;
     }
-  }, [playlists, pendingPlaylistLoad, homeData.weeklyJams, homeData.weeklyExploration]);
+    // Any plug-in's unsaved playlist with a link (a recommended playlist, a
+    // history mix): rebuilt from the link through the plug-in the registry
+    // says owns it, once the plug-ins have loaded. Its tracks load through the
+    // shared lookup, as they did when it was opened.
+    if (kind === 'link') {
+      const resolverId = resolverLoaderRef.current?.findResolverForUrl(pendingPlaylistLoad.sourceUrl) || null;
+      if (!resolverId) return;
+      console.log(`📦 Rebuilding ephemeral playlist from its link for restored view: ${pendingPlaylistLoad.title}`);
+      const record = linkRestoreRecord(pendingPlaylistLoad, resolverId);
+      const item = { id: pendingPlaylistLoad.id, url: pendingPlaylistLoad.sourceUrl, name: pendingPlaylistLoad.title, resolverId };
+      setPendingPlaylistLoad(null);
+      loadPlaylist({ ...record, creator: record.creator || pluginName(resolverId), fetchTracks: () => recommendationPlaylistTracks(item) }, { skipNavigation: true });
+      return;
+    }
+    if (kind === 'ephemeral') return; // can't be rebuilt: the timeout below sends it back
+    // A saved playlist, in the playlists by id. Hosted ones may still be
+    // loading, so this waits rather than falling back.
+    const playlist = playlists.find(p => p.id === pendingPlaylistLoad.id);
+    if (playlist) {
+      console.log(`📦 Loading playlist for restored view: ${playlist.title}`);
+      setPendingPlaylistLoad(null);
+      // loadPlaylist parses XSPF and fills playlistTracks; the view is already set.
+      loadPlaylist(playlist, { skipNavigation: true });
+    }
+  }, [playlists, pendingPlaylistLoad, homeData.weeklyJams, homeData.weeklyExploration, loadedResolvers]);
 
   // Give up on pending playlist load after timeout (hosted playlists should be loaded by then)
   useEffect(() => {
     if (pendingPlaylistLoad) {
       const timer = setTimeout(() => {
         if (pendingPlaylistLoad) {
-          // For ephemeral ListenBrainz playlists, fall back to Recommendations
-          // (its Playlists section holds Weekly Jams and Exploration). Through
-          // navigateTo so the page loads on arrival; the history then starts
-          // there, as the old fallback's did.
-          if (pendingPlaylistLoad.isHistoryMix) {
-            console.log(`📦 History mix not restorable: ${pendingPlaylistLoad.title}, falling back to Home`);
+          // Not found or rebuilt in time: a history mix goes back to Home,
+          // any other unsaved playlist to Recommendations (through navigateTo,
+          // so the page loads on arrival), a saved one to Playlists.
+          const fallback = restoreFallbackView(pendingPlaylistLoad);
+          if (fallback !== 'playlists') {
+            console.log(`📦 Playlist not restorable: ${pendingPlaylistLoad.title}, falling back to ${fallback}`);
             setPendingPlaylistLoad(null);
-            navigateTo('home');
-            setViewHistory(['home']);
-          } else if (pendingPlaylistLoad.isEphemeral && pendingPlaylistLoad.source === 'listenbrainz') {
-            console.log(`📦 Weekly Jam not found after timeout: ${pendingPlaylistLoad.title}, falling back to recommendations view`);
-            setPendingPlaylistLoad(null);
-            navigateTo('recommendations');
-            setViewHistory(['recommendations']);
+            navigateTo(fallback);
+            setViewHistory([fallback]);
           } else {
             console.log(`📦 Playlist not found after timeout: ${pendingPlaylistLoad.title}, falling back to playlists view`);
             setPendingPlaylistLoad(null);
@@ -25321,18 +24700,17 @@ ${trackListXml}
         setMetaServices(prev => prev.filter(s => s.id !== resolverId));
         // Clear the service's config so dependent features (recommendations, weekly jams) stop
         await clearMetaServiceConfig(resolverId);
-        // Clear cached data that depends on this service
-        if (resolverId === 'lastfm' || resolverId === 'listenbrainz') {
-          setRecommendations({ sections: [], loading: false, error: 'not_configured' });
-          recommendationsCache.current = { providers: {}, timestamp: 0 };
-          saveRecommendationsCache();
-        }
-        if (resolverId === 'listenbrainz') {
-          setHomeData(prev => ({ ...prev, weeklyJams: null, weeklyExploration: null }));
-        }
       } else {
         setLoadedResolvers(prev => prev.filter(r => r.id !== resolverId));
       }
+      // Forget ITS cached recommendations, similar listeners and history
+      // mixes, and keep everyone else's (#1519; any plug-in, by what it
+      // cached, never a name). The page and Home's weekly rows rebuild
+      // without it when the provider set changes.
+      recommendationsCache.current = cacheWithoutProvider(recommendationsCache.current, resolverId);
+      saveRecommendationsCache();
+      historyMixesCache.current = cacheWithoutProvider(historyMixesCache.current, resolverId);
+      saveHistoryMixesCache();
       setResolverOrder(prev => prev.filter(id => id !== resolverId));
       setActiveResolvers(prev => prev.filter(id => id !== resolverId));
       // Drop its status reply too (a status-capable plugin): the entry is
@@ -33229,7 +32607,7 @@ Variety guidance: ${theme} Be creative and surprising — avoid defaulting to th
     if (problem) throw new Error(problem);
     const result = await window.electron.publicFetch(url, 'hosted-playlist');
     if (!result || !result.success) throw new Error(result?.error || 'Failed to fetch the playlist');
-    if (!result.ok) throw new Error(`Failed to fetch: ${result.status}`);
+    if (!result.ok) throw Object.assign(new Error(`Failed to fetch: ${result.status}`), hostedStatusIsGone(result.status) ? { reason: 'not-found' } : {});
     // Belt and braces: the main process already enforced both.
     const afterProblem = window.hostedPlaylistFetchProblem(url, result.finalUrl, result.text.length);
     if (afterProblem) throw new Error(afterProblem);
@@ -33579,6 +32957,7 @@ Variety guidance: ${theme} Be creative and surprising — avoid defaulting to th
       return true;
     } catch (error) {
       console.error('Refresh error:', error);
+      if (await snapshotGoneSource(playlist, error)) return false;
       if (!background) showToast(error?.message || 'Could not refresh playlist', 'error');
       return false;
     }
@@ -33616,10 +32995,23 @@ Variety guidance: ${theme} Be creative and surprising — avoid defaulting to th
   // Already imported from this link: importing it again refreshes it, as
   // before, and doesn't ask.
   const isPlaylistLinkImported = (url) => (playlistsRef.current || []).some(p => p.sourceUrl === url);
+  // Save a service playlist to the person's playlists without opening it
+  // (#1659): the card's right-click "Save to Playlists" and the opened
+  // playlist's Save both run this (lib/save-service-playlist.js), the link
+  // import that fetches the list and saves it, resolving nothing.
+  const saveServicePlaylist = ({ url, name, coverArt }) => saveServicePlaylistLink({ url, name, coverArt }, {
+    isImported: isPlaylistLinkImported,
+    importFromUrl: (link, overrides, opts) => handleImportPlaylistFromUrl(link, false, null, overrides, opts),
+    findSaved: (link) => (playlistsRef.current || []).find((p) => p.sourceUrl === link) || null,
+    openPlaylist: (playlist) => loadPlaylist(playlist),
+    showToast,
+    errorText,
+  });
+  saveServicePlaylistRef.current = saveServicePlaylist;
 
   // Switch a link-imported playlist between kept updated and a snapshot.
   // Keeping it updated also brings it up to date now.
-  const setPlaylistUpdateMode = async (playlistId, mode) => {
+  const setPlaylistUpdateMode = async (playlistId, mode, { quiet = false } = {}) => {
     const playlist = (playlistsRef.current || []).find(p => p.id === playlistId);
     if (!playlist?.sourceUrl) return;
     const providerImported = window.isProviderImportedPlaylist(playlist, resolverLoaderRef.current);
@@ -33641,9 +33033,23 @@ Variety guidance: ${theme} Be creative and surprising — avoid defaulting to th
       // playlistsRef catches up on the next render; refresh reads it.
       playlistsRef.current = (playlistsRef.current || []).map(p => (p.id === playlistId ? updated : p));
       await refreshHostedPlaylist(playlistId);
-    } else {
+    } else if (!quiet) {
       showToast(`“${playlist.title}” is now a snapshot`);
     }
+  };
+
+  // A kept-updated playlist whose source is gone for good (the service says
+  // so: a plug-in's `reason: 'not-found'`, a hosted document's 404 or 410)
+  // becomes a snapshot, keeping its tracks, and says so once. Any other
+  // failure keeps retrying. True when it switched (lib/playlist-update-mode.js).
+  const snapshotGoneSource = async (playlist, error) => {
+    if (!isSourceGone(error) || !playlist) return false;
+    const providerImported = window.isProviderImportedPlaylist(playlist, resolverLoaderRef.current);
+    if (playlistUpdateMode(playlist, { providerImported }) !== 'auto') return false;
+    await setPlaylistUpdateMode(playlist.id, 'snapshot', { quiet: true });
+    const resolverId = resolverLoaderRef.current?.findResolverForUrl(playlist.sourceUrl) || null;
+    showToast(goneSnapshotMessage(playlist.title, resolverId ? pluginName(resolverId) : null));
+    return true;
   };
 
   // Poll hosted playlists for updates
@@ -33677,6 +33083,7 @@ Variety guidance: ${theme} Be creative and surprising — avoid defaulting to th
           }
         } catch (error) {
           console.error(`Failed to check playlist ${playlist.title}:`, error);
+          if (await snapshotGoneSource(playlist, error)) continue;
         }
       }
     };
@@ -35434,9 +34841,9 @@ useEffect(() => {
   // PLAYLIST_VIEW_PAGE_HANDLERS in playlist-view-page.js).
   const playlistViewPageHandlers = useStableHandlers({
     addToQueue, copyParachordLink, deletePlaylistLocally, fetchArtistData,
-    getPlaylistMirrorTargets, handleExportPlaylist, handleImportPlaylistFromUrl, handlePlay, handlePlaylistDragEnd,
+    getPlaylistMirrorTargets, handleExportPlaylist, handlePlay, handlePlaylistDragEnd,
     linkUpdateMode, markPlaylistAsLocallyModified, moveInEditedPlaylist, navigateTo,
-    refreshHostedPlaylist, savePlaylistToStore, setPlaylistUpdateMode, setQueueWithContext,
+    refreshHostedPlaylist, savePlaylistToStore, saveServicePlaylist, setPlaylistUpdateMode, setQueueWithContext,
     showConfirmDialog,
   });
 
@@ -35468,7 +34875,9 @@ useEffect(() => {
     const cache = recommendationPlaylistLookupsRef.current;
     const hit = cache.get(item.url);
     if (hit && Date.now() - hit.at < PLAYLIST_LOOKUP_TTL) return hit.promise;
-    const entry = { promise: loadPlaylistTracks(item), at: Date.now() };
+    const entry = { promise: loadPlaylistTracks(item), at: Date.now(), resolved: null };
+    // Kept once it lands, so a right-click can show the tracks at once.
+    entry.promise.then((resolved) => { entry.resolved = resolved; }, () => {});
     cache.set(item.url, entry);
     entry.promise.catch(() => { if (cache.get(item.url) === entry) cache.delete(item.url); });
     return entry.promise;
@@ -35492,7 +34901,10 @@ useEffect(() => {
   };
   const recommendationPlaylistTracks = async (item) => {
     const resolved = await lookupRecommendationPlaylist(item);
-    return resolved.tracks.map((t) => ({
+    return servicePlaylistTracksFrom(resolved);
+  };
+  // One mapping for every playlist action and the right-click menu.
+  const servicePlaylistTracksFrom = (resolved) => ((resolved && resolved.tracks) || []).map((t) => ({
       id: trackSlug(t.artist || '', t.title || ''),
       title: t.title,
       artist: t.artist,
@@ -35518,6 +34930,14 @@ useEffect(() => {
       ...(t.isrc ? { isrc: t.isrc } : {}),
       ...(t.mbid ? { mbid: t.mbid } : {})
     }));
+  // The tracks of a service playlist the lookup already has (the hover's
+  // prefetch landed), or null: the right-click menu shows them at once, or
+  // reads "loading…" (#1659).
+  const cachedServicePlaylistTracks = (item) => {
+    if (!item || !item.url) return null;
+    const hit = recommendationPlaylistLookupsRef.current.get(item.url);
+    if (!hit || !hit.resolved || Date.now() - hit.at >= PLAYLIST_LOOKUP_TTL) return null;
+    return servicePlaylistTracksFrom(hit.resolved);
   };
 
   // Play, or add to the queue, a service playlist (a recommended playlist,
@@ -35868,7 +35288,7 @@ useEffect(() => {
   // Stable function props for the memo'd SyncSetupDialog (keys must
   // match SYNC_SETUP_DIALOG_HANDLERS in sync-setup-dialog.js).
   const syncSetupDialogHandlers = useStableHandlers({
-    setProviderSyncEnabled, startSync,
+    setLovePushEnabled, setProviderSyncEnabled, startSync,
   });
 
   // Stable function props for the memo'd SyncStatusDialog (keys must
@@ -35971,7 +35391,7 @@ useEffect(() => {
     applemusic: { nativeApp: appleMusicNativeAvailable },
   }), [appleMusicNativeAvailable]);
   const pluginSettingsDialogHandlers = useStableHandlers({
-    clearMetaServiceConfig, fetchDynamicModels, getServiceColor, handleAddWatchFolder, handleInstallFromMarketplace, handleRemoveMissingFiles, handleRemoveWatchFolder, handleRescanAll, handleRescanFolder, handleUninstallResolver, manageAmazonMusic, openPlaybackQualitySettings, openSyncSetupModal, refreshPluginStatus, saveMetaServiceConfig, setProviderSyncEnabled, setResolverMetadataOn, setResolverPlaybackOn, setResolverRecommendationsOn, showConfirmDialog, toggleResolver,
+    clearMetaServiceConfig, fetchDynamicModels, getServiceColor, handleAddWatchFolder, handleInstallFromMarketplace, handleRemoveMissingFiles, handleRemoveWatchFolder, handleRescanAll, handleRescanFolder, handleUninstallResolver, openPlaybackQualitySettings, promptPluginSignIn, openSyncSetupModal, refreshPluginStatus, saveMetaServiceConfig, setProviderSyncEnabled, setResolverMetadataOn, setResolverPlaybackOn, setResolverRecommendationsOn, showConfirmDialog, toggleResolver,
   });
 
   // The accounts the app itself signs in to, for the plug-in settings
@@ -36076,7 +35496,7 @@ useEffect(() => {
   // the service-playlist functions it passes: a hook above their
   // declarations reads them in the TDZ.
   const recommendationsPageHandlers = useStableHandlers({
-    addServicePlaylistToPlaylist, albumCardActions, cancelRecommendationPlaylistPrefetch, copyParachordLink, fetchAlbumTracksFromMusicBrainz, fetchArtistData, handleCollectionAlbumClick, loadPlaylist, loadRecommendations, loadWeeklyJamTracks, navigateToFriend, observedRowRef, openServicePlaylist, playArtistTopTracks, playListenerTopTracks, playServicePlaylist, playTrackRow, prefetchRecommendationPlaylist, prefetchTopAlbumTracks, queueServicePlaylist, toggleRecommendationSection, trackRowDrag,
+    addServicePlaylistToPlaylist, albumCardActions, cachedServicePlaylistTracks, cancelRecommendationPlaylistPrefetch, copyParachordLink, fetchAlbumTracksFromMusicBrainz, fetchArtistData, handleCollectionAlbumClick, loadPlaylist, loadRecommendations, loadWeeklyJamTracks, navigateToFriend, observedRowRef, openServicePlaylist, playArtistTopTracks, playListenerTopTracks, playServicePlaylist, playTrackRow, prefetchRecommendationPlaylist, prefetchTopAlbumTracks, queueServicePlaylist, toggleRecommendationSection, trackRowDrag,
   });
 
   // Stable function props for the memo'd HomePage (keys must match
@@ -36096,6 +35516,22 @@ useEffect(() => {
     soundcloud: soundcloudConnected
   }), [spotifyConnected, appleMusicConnected, soundcloudConnected]);
   const pluginAccounts = useMemo(() => PluginSetup.signedInMap(hostSignIns, pluginStatuses), [hostSignIns, pluginStatuses]);
+
+  // Loves in sync (#1445, lib/love-providers.js): every love provider with
+  // its push switch and whether it can push. One with library sync
+  // (ListenBrainz) gets the switch in its sync dialog; one without (Last.fm,
+  // a server's stars) gets a loves-only row in the Collection's Sync menu.
+  // The same setting as the plug-in's "Push loves to X", never a second one.
+  // scrobblersInitialized: Last.fm's and ListenBrainz's providers register
+  // with the scrobblers. pluginAccounts: a plug-in that signs in (Apple
+  // Music) is ready when signed in (#1559 step 5).
+  const loveRows = useMemo(() => loveSyncRows([...metaServices, ...loadedResolvers], {
+    scrobblerConfigs, pluginConfigs: metaServiceConfigs, pushEnabled: scrobblerLovePushEnabled, signedInMap: pluginAccounts,
+  }), [metaServices, loadedResolvers, scrobblerConfigs, metaServiceConfigs, scrobblerLovePushEnabled, scrobblersInitialized, pluginAccounts]);
+  const syncMenuLoveRows = useMemo(() => loveRows.filter((r) => !syncProviderConfig[r.id]), [loveRows, syncProviderConfig]);
+  const syncDialogLoves = useMemo(
+    () => Object.fromEntries(loveRows.filter((r) => syncProviderConfig[r.id]).map((r) => [r.id, r])),
+    [loveRows, syncProviderConfig]);
   // Settings › Plug-Ins marks an enabled plug-in "Needs setup" from this
   // map ({ [id]: true }), so the page never names a service (#1522). The
   // facts are the same ones: the plug-in's own status reply first, then
@@ -36192,11 +35628,10 @@ useEffect(() => {
       spotify: pluginSetupNeeded.spotify ? null : connectSpotify,
       soundcloud: soundcloudCredentialsSource !== 'none' ? connectSoundcloud : null,
       applemusic: connectAppleMusic,
-      // Amazon's sign-in carries its own prompt flow, as in the plug-in
-      // dialog; the flow refreshes the status itself.
-      amazonmusic: () => manageAmazonMusic({ explicit: true, reason: 'not-signed-in', forcePrompt: true })
-    }[pluginId] || (plugin.capabilities?.status && typeof plugin.signIn === 'function'
-      ? () => Promise.resolve(plugin.signIn()).catch(() => null).then(() => refreshPluginStatus(pluginId))
+    }[pluginId] || (promptPluginSignIn.canPrompt(pluginId)
+      // A plug-in on the status surface signs in through the one prompt
+      // flow (#1624), which reads its status again itself.
+      ? () => promptPluginSignIn(pluginId, { explicit: true, reason: 'not-signed-in', forcePrompt: true })
       : null);
     // Switched on only when the sign-in runs here: a plug-in that still needs
     // setup opens its panel as it is, where you set it up and turn it on.
@@ -36236,7 +35671,7 @@ useEffect(() => {
     addToQueue, albumCardActions, copyParachordLink, fetchArtistData, getAlbumArt, getArtistImage,
     getArtistTopTracks, getCollectionSortOptions, handleCollectionAlbumClick, handlePlay,
     handlePlaylistDragEnd, handleStartCollectionStation, isOnAir, navigateToFriend,
-    openChartsAlbum, openSyncSetupModal, playArtistTopTracks, playListenerTopTracks, setProviderSyncEnabled, setQueueWithContext, syncFriendsFromServices,
+    openChartsAlbum, openPluginSettings, openSyncSetupModal, playArtistTopTracks, playListenerTopTracks, setLovePushEnabled, setProviderSyncEnabled, setQueueWithContext, syncFriendsFromServices,
   });
 
 
@@ -36443,7 +35878,7 @@ useEffect(() => {
 
         // Library view with collapsible hero header (matching Recommendations pattern)
         activeView === 'library' && React.createElement(CollectionPage, {
-          activeResolvers: playbackResolvers, allResolvers, autoPinnedFriendIds, collectionAlbums, collectionArtists, collectionData, collectionHeaderCollapsed, collectionSongs, collectionLoading, collectionObserverRef, collectionScrollContainerRef, collectionSearch, collectionSearchOpen, collectionSongsSorted, collectionSort, collectionTab, collectionTrackRowRefs, currentTrack, filterCollectionItems, friendSyncInProgress, friends, handleCollectionScrollContainerRef, isPlaying, libraryLoading, metaServiceConfigs, pinnedFriendIds, playbackContext, resolverOrder, resolverSyncSettings, syncPausedUntil, syncSignedOut: syncSignedOutView, setAddFriendModalOpen, setAddToPlaylistPanel, setCollectionHeaderCollapsed, setCollectionSearch, setCollectionSearchOpen, setCollectionSort, setCollectionTab, setDraggingTrackForPlaylist, setSyncStatusModal, setTrackLoading, showToast, sortCollectionItems, syncProviderConfig, syncStatus, trackSources,
+          activeResolvers: playbackResolvers, allResolvers, autoPinnedFriendIds, collectionAlbums, collectionArtists, collectionData, collectionHeaderCollapsed, collectionSongs, collectionLoading, collectionObserverRef, collectionScrollContainerRef, collectionSearch, collectionSearchOpen, collectionSongsSorted, collectionSort, collectionTab, collectionTrackRowRefs, currentTrack, filterCollectionItems, friendSyncInProgress, friends, handleCollectionScrollContainerRef, isPlaying, libraryLoading, metaServiceConfigs, pinnedFriendIds, playbackContext, resolverOrder, resolverSyncSettings, syncMenuLoveRows, syncPausedUntil, syncSignedOut: syncSignedOutView, setAddFriendModalOpen, setAddToPlaylistPanel, setCollectionHeaderCollapsed, setCollectionSearch, setCollectionSearchOpen, setCollectionSort, setCollectionTab, setDraggingTrackForPlaylist, setSyncStatusModal, setTrackLoading, showToast, sortCollectionItems, syncProviderConfig, syncStatus, trackSources,
           ...collectionPageHandlers
         }),
 
@@ -37137,12 +36572,12 @@ useEffect(() => {
       onCancel: () => answerUpdateModeAsk(null)
     }),
 
-    // Amazon Music sign-in dialog. Opens music.amazon.com inside Parachord.
-    // The standard dialog (components/modal.js). While the sign-in window
-    // opens it can't be dismissed.
-    /* AmazonManageDialog (components/amazon-manage-dialog.js), a memo'd dialog. */ amazonManageDialog.show && React.createElement(AmazonManageDialog, {
-      amazonManageDialog,
-      setAmazonManageDialog
+    // A plug-in's sign-in question (#1624). The standard dialog
+    // (components/modal.js). While the sign-in window is open it can't be
+    // dismissed.
+    /* PluginSignInDialog (components/plugin-sign-in-dialog.js), a memo'd dialog. */ pluginSignInDialog.show && React.createElement(PluginSignInDialog, {
+      pluginSignInDialog,
+      setPluginSignInDialog
     }),
 
     // Synced Playlist Delete Dialog
@@ -37180,6 +36615,7 @@ useEffect(() => {
     // SyncSetupDialog (components/sync-setup-dialog.js), a memo'd dialog.
     syncSetupModal.open && React.createElement(SyncSetupDialog, {
       resolverSyncSettings,
+      syncDialogLoves,
       setSyncSetupModal,
       syncProviderConfig,
       syncSetupModal,

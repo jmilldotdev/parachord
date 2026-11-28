@@ -56,7 +56,26 @@ function hostedListForMode(list, playlist, mode, { providerImported } = {}) {
   }];
 }
 
+// A kept-updated playlist whose source is gone for good becomes a snapshot
+// (its tracks kept). Gone means the service SAYS so: a plug-in's
+// lookupPlaylist throws with `reason: 'not-found'` (the convention plug-ins
+// use for 'plan-ineligible'), and a hosted XSPF's server answers 404 or 410.
+// Anything else (offline, signed out, a 500) is a failure that retries.
+function isSourceGone(error) {
+  return !!(error && error.reason === 'not-found');
+}
+function hostedStatusIsGone(status) {
+  return status === 404 || status === 410;
+}
+function goneSnapshotMessage(title, serviceName) {
+  const where = serviceName ? `on ${serviceName}` : 'at its link';
+  return `“${title}” is no longer ${where}, so it’s now a snapshot. Its tracks are kept.`;
+}
+
 module.exports = {
+  isSourceGone,
+  hostedStatusIsGone,
+  goneSnapshotMessage,
   SERVICE_REFRESH_MS,
   playlistUpdateMode,
   isPolledHostedXspf,

@@ -339,8 +339,13 @@ describe('fix round 1', () => {
   });
 
   test('an opened history mix restores to Home, not Recommendations or Playlists', () => {
-    expect(app).toContain('viewData.isHistoryMix = Object.values(mixProviders).some(');
-    expect(app).toMatch(/pendingPlaylistLoad\.isHistoryMix\) \{[\s\S]{0,300}navigateTo\('home'\)/);
+    // Saved with the view, and Back (or a restore that can't rebuild it)
+    // goes Home (lib/ephemeral-playlist-restore.js, #1519; a mix with a link
+    // now reopens from it).
+    expect(app).toContain('const isHistoryMix = !!selectedPlaylist.isEphemeral && Object.values(mixProviders).some(');
+    const R = require('../../src/renderer/lib/ephemeral-playlist-restore');
+    expect(R.restoreFallbackView({ isEphemeral: true, isHistoryMix: true, sourceUrl: 'https://x' })).toBe('home');
+    expect(R.restoreViewHistory({ isEphemeral: true, isHistoryMix: true })).toEqual(['home', 'playlist-view']);
   });
 
   test('a mix has no right-click menu, on the card or the Jump tile', () => {

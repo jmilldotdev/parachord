@@ -30,8 +30,10 @@ const { ProgressBar } = require('./progress-bar');
 const { AccountRow } = require('./account-row');
 const { Disclosure } = require('./disclosure');
 const { EmptyState, ErrorState } = require('./states');
-const { ServiceAccount, ClientKeys, AdvancedKeys, UsernameAccount, LibrarySync, StartupRow, InstallCallout, WatchFolders, PluginSwitches, PlaybackQualityRow, settingsOf, configurableOf, authTypeOf } = require('./plugin-extras');
+const { ServiceAccount, ClientKeys, AdvancedKeys, UsernameAccount, LibrarySync, StartupRow, InstallCallout, WatchFolders, PluginSwitches, PlaybackQualityRow, LovedTracks, settingsOf, configurableOf, authTypeOf } = require('./plugin-extras');
+const { lovesOf, loveWords, loveRowState } = require('../lib/love-providers');
 const { playbackQualityLine } = require('../lib/playback-quality-line');
+const { canPromptPlugin } = require('../lib/plugin-sign-in-flow');
 
 const PLUGIN_SETTINGS_DIALOG_HANDLERS = [
   'fetchDynamicModels',
@@ -43,7 +45,7 @@ const PLUGIN_SETTINGS_DIALOG_HANDLERS = [
   'handleRescanAll',
   'handleRescanFolder',
   'handleUninstallResolver',
-  'manageAmazonMusic',
+  'promptPluginSignIn',
   'openPlaybackQualitySettings',
   'openSyncSetupModal',
   'refreshPluginStatus',
@@ -91,7 +93,7 @@ const PluginSettingsDialog = React.memo(function PluginSettingsDialog(props) {
     loveImportProgress,
     loveImportRunning,
     lovePushedKeysRef,
-    manageAmazonMusic,
+    promptPluginSignIn,
     openPlaybackQualitySettings,
     marketplaceManifest,
     metaServiceConfigs,
@@ -180,21 +182,38 @@ const PluginSettingsDialog = React.memo(function PluginSettingsDialog(props) {
           // Signed out: clear the plug-in's account too.
           : { ...metaServiceConfigs[id], enabled: false, username: undefined });
       },
-      lovePushEnabled: !!scrobblerLovePushEnabled[id],
-      onSetLovePushEnabled: (v) => setLovePushEnabled(id, v),
-      onRunBackfill: () => runLoveBackfill(id),
-      backfillRunning: !!loveBackfillRunning[id],
-      backfillProgress: loveBackfillProgress[id],
-      unpushedCount: (collectionDataRef.current?.tracks || collectionData.tracks).filter(t => !lovePushedKeysRef.current[t.id]?.[id]).length,
-      onRunLoveImport: () => runLoveImport(id),
-      // Whose loves to import: the scrobbling sign-in's username, else the
-      // account's (both services publish loves by username, no sign-in).
-      loveImportUsername: scrobblerConfigs[id]?.username || metaServiceConfigs[id]?.username || null,
-      loveImportRunning: !!loveImportRunning[id],
-      loveImportProgress: loveImportProgress[id],
-      hasImportedLoves: !!loveImportCursorRef.current?.[id],
     });
   };
+
+  // Loves (the manifest's `loves`, lib/love-providers.js, #1559): Import,
+  // Push and Send, the same rows for Last.fm, ListenBrainz and a server's
+  // stars. What they need (the scrobbling sign-in, a username, the server set
+  // up) comes from loveRowState. A username account (Last.fm, ListenBrainz)
+  // draws them inside, after Scrobbling and before its Advanced; any other
+  // plug-in, after its account, keys and switches.
+  const lovedTracksSection = lovesOf(selectedResolver) && (() => {
+    const id = selectedResolver.id;
+    const loves = lovesOf(selectedResolver);
+    const name = selectedResolver.name || id;
+    return React.createElement(LovedTracks, {
+      key: `${id}-loves`,
+      name,
+      words: loveWords(loves.verb),
+      canImport: loves.canImport,
+      state: loveRowState(selectedResolver, { name, scrobblerConfig: scrobblerConfigs[id], pluginConfig: metaServiceConfigs[id], signedIn }),
+      pushEnabled: !!scrobblerLovePushEnabled[id],
+      onSetPush: (v) => setLovePushEnabled(id, v),
+      onImport: () => runLoveImport(id),
+      importRunning: !!loveImportRunning[id],
+      importProgress: loveImportProgress[id],
+      hasImported: !!loveImportCursorRef.current?.[id],
+      onSend: () => runLoveBackfill(id),
+      sendRunning: !!loveBackfillRunning[id],
+      sendProgress: loveBackfillProgress[id],
+      unpushedCount: (collectionDataRef.current?.tracks || collectionData.tracks).filter(t => !lovePushedKeysRef.current[t.id]?.[id]).length,
+      inAccount: accountType === 'username',
+    });
+  })();
 
   // A plug-in that needs a sign-in (a sign-in the app runs, settings.account
   // type 'sign-in'; or one that signs in itself, capabilities.status) can't
@@ -426,24 +445,14 @@ React.createElement('div', {
                     }
                   } : undefined,
                 onSignIn: canSignIn ? async () => {
-                    // A web-session plug-in (settings.authType 'web-session')
-                    // signs in through the host's prompt flow (the consent
-                    // dialog, single-flight, the 10-minute quiet after a
-                    // decline, the hiccup retry); every other plugin's signIn
-                    // is the window itself.
-                    //
-                    // TODO(#1440 review, note 3, before a second web-session
-                    // plugin): the host has one web-session instance
-                    // (main-process/amazon-web-session.js), and its prompt
-                    // flow (manageAmazonMusic) still reads
-                    // getResolver('amazonmusic'), as does the tile badge's
-                    // needsConfiguration arm. A second web-session plug-in
-                    // needs that flow to take the plug-in's id (its own
-                    // prompt decision, like signInPromptDecision), so the
-                    // row, the tile and the prompt read the plugin, never the id.
-                    if (authTypeOf(selectedResolver) === 'web-session') {
-                      await manageAmazonMusic({ explicit: true, reason: 'not-signed-in', forcePrompt: true });
-                      return; // the flow refreshes the status itself
+                    // A plug-in on the status surface signs in through the
+                    // one prompt flow (#1624, lib/plugin-sign-in-flow.js:
+                    // "Sign in to X?" with its own tip, single-flight, the
+                    // quiet after a Not now); it reads the status again
+                    // itself. Any other plug-in's signIn is the window itself.
+                    if (canPromptPlugin(selectedResolver)) {
+                      await promptPluginSignIn(selectedResolver.id, { explicit: true, reason: 'not-signed-in', forcePrompt: true });
+                      return;
                     }
                     await selectedResolver.signIn().catch(() => null);
                     refreshPluginStatus(selectedResolver.id);
@@ -480,7 +489,10 @@ React.createElement('div', {
             // Scrobbling: its own sign-in, its switch and loved tracks,
             // nested under the account it adds to, before Advanced.
             scrobblingNested && React.createElement('div', { 'data-section': 'scrobbling', style: { marginTop: '16px' } },
-              React.createElement(NestedSettings, null, renderScrobbling(selectedResolver.id)))),
+              React.createElement(NestedSettings, null, renderScrobbling(selectedResolver.id))),
+            // Its loves, after Scrobbling (pushing needs that sign-in) and
+            // before Advanced.
+            lovedTracksSection),
 
           // What needs the sign-in: library sync (capabilities.librarySync),
           // then opening the service's app at startup (settings.startup).
@@ -572,6 +584,11 @@ React.createElement('div', {
               delete resolverConfigCache.current[selectedResolver.id];
             },
           }),
+
+          // Loves, for every other plug-in (a server's stars): after its
+          // account, its keys and its switches.
+          accountType !== 'username' && lovedTracksSection,
+
 
           // How its playback quality is set (#1608), while it's on: it follows
           // Settings › General › Playback Quality, or where it's set instead

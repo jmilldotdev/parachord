@@ -74,6 +74,12 @@ function playlistMenu(playlist, tracks, opts = {}) {
     tracks: Array.isArray(tracks) ? tracks : [],
   };
   if (opts.isEphemeral) out.isEphemeral = true;
+  // A service's playlist that isn't saved yet (#1659): the link its "Save to
+  // Playlists" imports, the cover the card showed (kept on save), and
+  // loading while its tracks are still on their way.
+  if (opts.saveUrl) out.saveUrl = opts.saveUrl;
+  if (opts.coverArt) out.coverArt = opts.coverArt;
+  if (opts.loading !== undefined) out.loading = !!opts.loading && out.tracks.length === 0;
   // On ListenBrainz, so on Achordion: main.js offers View on Achordion.
   const lbMbid = lbMbidOf(p);
   if (lbMbid) out.listenbrainzMbid = lbMbid;

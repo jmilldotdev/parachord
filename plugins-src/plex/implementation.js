@@ -755,6 +755,97 @@ module.exports = {
     return !!(config && config.authToken && config.libraries && config.libraries.length);
   },
 
+  // Loves (Parachord/parachord#1559 step 7): Plex has no like of its own.
+  // Plexamp's like is a 5-star rating, stored as userRating 10 on Plex's
+  // 0-10 scale, so a heart in Parachord rates the track 10 when "Push likes
+  // to Plex" is on, and Import adds your 5-star tracks to the Collection,
+  // each playable from your server. A love is a like, so the heart raises
+  // whatever rating the track had; Parachord never lowers or clears one.
+  // The write is PUT /:/rate (python-plexapi's rate(); Plex doesn't document
+  // it). The manifest's `loves` field says the track is identified by its
+  // ratingKey on its server (needs: 'serviceId'), so the host finds it
+  // first: the track arrives with its source here in track.sources.plex.
+  // Built without a live server (2026-11-28): see the list's filter below.
+  loveTrack: async function (track, config) {
+    var pluginId = this.id || 'plex';
+    var sources = track && track.sources && typeof track.sources === 'object' && !Array.isArray(track.sources) ? track.sources : null;
+    var source = sources ? sources[pluginId] : null;
+    var ratingKey = source && source.plexRatingKey;
+    var serverId = source && source.plexServerId;
+    if (!ratingKey || !serverId) return { ok: false, reason: 'no-match' };
+    var server = await this._serverFor(serverId, config);
+    if (!server) return { ok: false, reason: 'no-match' };
+    var base = await this._baseUrl(server);
+    if (!base) throw new Error('Plex like failed: ' + (server.serverName || 'the server') + ' could not be reached');
+    var url = base + '/:/rate?key=' + encodeURIComponent(ratingKey) + '&identifier=com.plexapp.plugins.library&rating=10' +
+      '&X-Plex-Token=' + encodeURIComponent(server.accessToken);
+    var resp = await this._fetch(url, { method: 'PUT', headers: { 'Accept': 'application/json' } });
+    if (!resp || !resp.ok) throw new Error('Plex like failed: HTTP ' + (resp ? resp.status : 0));
+    return { ok: true, ref: String(ratingKey) };
+  },
+
+  // Your 5-star tracks in the chosen libraries, newest rating first
+  // (lastRatedAt), in one page: each carries its source on its server, built
+  // like a search result without the album art (its URL bakes in the token).
+  // The server is asked for tracks rated above 9 (Plex's `>>=` filter); every
+  // row is checked again here, and a server that refuses the filter is asked
+  // without it, so the list is 5-star tracks only either way. `account`
+  // isn't needed: each server answers for the signed-in user.
+  getLovedPage: async function (args, config) {
+    if (!this.isConfigured(config)) throw new Error('Not connected to Plex');
+    var self = this;
+    var byId = {};
+    var items = [];
+    var pageSize = 1000;
+    var listUrl = function (base, libKey, start, filtered) {
+      return base + '/library/sections/' + encodeURIComponent(libKey) + '/all?type=10&includeGuids=1' +
+        (filtered ? '&userRating%3E%3E=9' : '') +
+        '&X-Plex-Container-Start=' + start + '&X-Plex-Container-Size=' + pageSize;
+    };
+    for (var li = 0; li < config.libraries.length; li++) {
+      var lib = config.libraries[li];
+      var server = { serverId: lib.serverId, serverName: lib.serverName, accessToken: lib.accessToken, connections: lib.connections };
+      var base = await self._baseUrl(server);
+      if (!base) throw new Error('Plex liked tracks failed: ' + (lib.serverName || 'a server') + ' could not be reached');
+      var tok = '&X-Plex-Token=' + encodeURIComponent(server.accessToken);
+      var filtered = true;
+      var start = 0;
+      for (;;) {
+        var resp = await self._fetch(listUrl(base, lib.key, start, filtered) + tok, { headers: { 'Accept': 'application/json' }, timeoutMs: 30000 });
+        if (!resp.ok && filtered && start === 0 && resp.status === 400) {
+          filtered = false;
+          continue;
+        }
+        if (!resp.ok) throw new Error('Plex liked tracks failed: HTTP ' + resp.status);
+        var data = await resp.json();
+        var c = (data && data.MediaContainer) || {};
+        var rows = c.Metadata || [];
+        for (var i = 0; i < rows.length; i++) {
+          var t = rows[i];
+          if (!t || !t.ratingKey || !(Number(t.userRating) >= 10)) continue;
+          var mapped = self._mapTrack(t, server, base);
+          if (byId[mapped.id]) continue;
+          byId[mapped.id] = true;
+          mapped.albumArt = null;
+          var item = {
+            artist: mapped.artist,
+            title: mapped.title,
+            album: mapped.album,
+            lovedAt: typeof t.lastRatedAt === 'number' && t.lastRatedAt > 0 ? t.lastRatedAt : null,
+            source: mapped
+          };
+          if (mapped.mbid) item.mbid = mapped.mbid;
+          items.push(item);
+        }
+        start += rows.length;
+        var total = c.totalSize || 0;
+        if (rows.length < pageSize || (total && start >= total)) break;
+      }
+    }
+    items.sort(function (a, b) { return (b.lovedAt || 0) - (a.lovedAt || 0); });
+    return { items: items, total: items.length, returned: items.length, next: null };
+  },
+
   // Settings panel. The host renders this through PluginSettingsPanel when
   // settings.authType is 'custom'. `ctx` carries React (hooks are fine: this
   // runs inside a real component, so call them unconditionally), the saved

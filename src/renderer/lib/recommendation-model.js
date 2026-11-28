@@ -893,7 +893,27 @@ function homeRecommendationAlbums({ sections, aiAlbums, imageFor } = {}) {
   return out;
 }
 
+// A recommendations cache (or the history mixes' one) without one plug-in's
+// entries (#1519): removing a plug-in forgets ITS cached answers, similar
+// listeners and mixes, and keeps everyone else's. The same object when it had
+// nothing cached; never mutated.
+function cacheWithoutProvider(cache, resolverId) {
+  if (!cache || !resolverId) return cache;
+  const has = (map) => !!(map && Object.prototype.hasOwnProperty.call(map, resolverId));
+  if (!has(cache.providers) && !has(cache.similarUsers)) return cache;
+  const drop = (map) => {
+    if (!has(map)) return map;
+    const next = { ...map };
+    delete next[resolverId];
+    return next;
+  };
+  const out = { ...cache, providers: drop(cache.providers) };
+  if (cache.similarUsers !== undefined) out.similarUsers = drop(cache.similarUsers);
+  return out;
+}
+
 module.exports = {
+  cacheWithoutProvider,
   PLAYLIST_CATEGORIES,
   ALBUM_CATEGORIES,
   CATEGORY_TABLES,

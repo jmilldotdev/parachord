@@ -319,31 +319,32 @@ describe('an MBID tombstone (the kind a mark-stored MBID writes on removal)', ()
   test('the summary counts merged loves under "already in your collection"', () => {
     const fs = require('fs');
     const path = require('path');
-    const app = fs.readFileSync(path.join(__dirname, '../..', 'src/renderer/app.js'), 'utf8');
+    const app = require('../helpers/renderer-source').appWithPages();
     expect(app).toContain('const matched = matchedLoves + plan1.merged + plan2.merged;');
   });
 });
 
 describe('wiring (source markers)', () => {
-  const app = read('src/renderer/app.js');
+  const app = require('../helpers/renderer-source').appWithPages();
 
   test('the import never routes through the live add or push paths (review focus 3)', () => {
-    const start = app.indexOf('const runLoveImport = useCallback');
-    const end = app.indexOf('// Remove track from collection', start);
+    const start = app.indexOf('const runLoveImport = React.useCallback');
+    const end = app.indexOf('\n  return {\n    scrobblerLovePushEnabled', start);
     const body = app.slice(start, end);
     expect(body).not.toContain('addTrackToCollection(');
     expect(body).not.toContain('pushLoveToScrobblers(');
   });
 
   test('the cross-service push goes through the restricted backfill, confirmed adds only, never unhandled', () => {
-    const start = app.indexOf('const runLoveImport = useCallback');
-    const end = app.indexOf('// Remove track from collection', start);
+    const start = app.indexOf('const runLoveImport = React.useCallback');
+    const end = app.indexOf('\n  return {\n    scrobblerLovePushEnabled', start);
     const body = app.slice(start, end);
-    expect(body).toContain('runLoveBackfill(otherService, { onlyIds: new Set(confirmedIds) }).catch(');
+    // Each other love provider the dialog named (#1559: was "the other one").
+    expect(body).toMatch(/for \(const otherId of otherIds\) \{[\s\S]*runLoveBackfill\(otherId, \{ onlyIds: new Set\(confirmedIds\) \}\)\.catch\(/);
   });
 
   test('runLoveBackfill filters by onlyIds when given', () => {
-    expect(app).toContain("const runLoveBackfill = useCallback(async (service, { onlyIds } = {}) => {");
+    expect(app).toContain("const runLoveBackfill = React.useCallback(async (service, { onlyIds } = {}) => {");
     expect(app).toContain('(!onlyIds || onlyIds.has(t.id))');
   });
 
@@ -364,18 +365,27 @@ describe('wiring (source markers)', () => {
     expect(app).toContain('onConfirm: () => resolve(true),');
     expect(app).toContain('onCancel: () => resolve(false),');
     // Connected, not just toggled.
-    expect(app).toContain('otherConnected = await otherScrobbler.isSignedIn();'); // signed in, not scrobbling-on
+    expect(app).toContain('otherConnected = await providerOf(id).isSignedIn();'); // signed in, not scrobbling-on
+    // Every other provider with push on is offered (#1559), named in one line.
+    // A service paused with its sync isn't offered either (#1445).
+    expect(app).toContain("if (id === service || !scrobblerLovePushEnabledRef.current?.[id] || pausedBySync(id)) continue;");
+    expect(app).toContain('otherLabel = andList(otherIds.map((id) => pluginName(id)));');
   });
 
   test('the import needs only a username: the scrobbling sign-in\'s, else the account\'s (2026-11-23)', () => {
-    const start = app.indexOf('const runLoveImport = useCallback(');
-    const body = app.slice(start, app.indexOf('const fetchPage =', start) + 400);
-    expect(body).toContain('const username = scrobblerConfigsRef.current?.[service]?.username || metaServiceConfigsRef.current?.[service]?.username;');
-    expect(body).toContain('Add your ${label} username first');
+    const start = app.indexOf('const runLoveImport = React.useCallback(');
+    const body = app.slice(start, app.indexOf('LoveImport.collectLoves({', start) + 400);
+    // The provider says whose (#1559): Last.fm's and ListenBrainz's read the
+    // scrobbling sign-in's username, else the account's (love-providers.js).
+    expect(body).toContain('const username = await provider.importAccount({ scrobblerConfig: scrobblerConfigsRef.current?.[service], pluginConfig: metaServiceConfigsRef.current?.[service] });');
+    expect(body).toContain('showToast(provider.importAccountHint(label), \'error\')');
+    const providers = require('fs').readFileSync(require('path').join(__dirname, '../../src/renderer/lib/love-providers.js'), 'utf8');
+    expect(providers).toContain('(scrobblerConfig && scrobblerConfig.username) || (pluginConfig && pluginConfig.username) || null');
+    expect(providers).toContain('importAccountHint: (name) => `Add your ${name} username first`');
     // Not gated on the scrobbling sign-in: both services publish loves by username.
     expect(body).not.toContain('connected = await scrobbler.isSignedIn();');
-    expect(body).toContain('getLovedTracksPage({ page, count, username })');
-    expect(body).toContain('getLovedTracksPage({ offset, count, username })');
+    // The provider's pages, read by the username (lib/love-providers.js, #1559).
+    expect(body).toContain('provider.getLovedPage({ cursor: pageCursor, account: username }, providerConfig(service))');
   });
 
   test('a failed tombstone read stops the run', () => {
@@ -406,17 +416,20 @@ describe('wiring (source markers)', () => {
   });
 
   test('the resolved MBID is stored on the ListenBrainz mark, so a removal tombstones the recording the service holds', () => {
-    expect(app).toContain("const pushedMbid = lovePushedKeysRef.current?.[track.id]?.listenbrainz;");
-    expect(app).toContain("await markLovePushed(track.id, 'listenbrainz', mbid);");
+    // The provider's `ref` (ListenBrainz's recording MBID) goes on the mark,
+    // and a removal reads it from whichever service stored it (#1559).
+    expect(app).toContain('const pushedMbid = LoveImport.markedMbid(lovePushedKeysRef.current?.[track.id]);');
+    expect(app).toContain('await markLovePushed(track.id, serviceId, result.ref);');
+    expect(app).toContain('await markLovePushed(track.id, service, result.ref);');
     // The storage itself: a plain timestamp would keep the marker passing while
     // losing the MBID.
     expect(app).toContain('? { at: Date.now(), mbid }');
-    expect(app).toContain('push(\'listenbrainz\', pushedMbid.mbid);');
+    expect(app).toContain('if (pushedMbid) push(LoveImport.MBID_TOMBSTONE_BUCKET, pushedMbid);');
   });
 
   test('a successful ListenBrainz push clears its own MBID tombstone (a re-add after a removal must import again)', () => {
-    expect(app).toContain("window.electron.tombstones.clearBatch([{ providerId: 'listenbrainz', externalId: mbid }])");
-    expect(app).toContain('clearListenbrainzLoveTombstone(mbid);');
+    expect(app).toContain('window.electron.tombstones.clearBatch([{ providerId: LoveImport.MBID_TOMBSTONE_BUCKET, externalId: mbid }])');
+    expect(app).toContain('clearLoveTombstone(result.ref);');
   });
 
   test('the import indexes the mark-stored MBIDs alongside the rows\' own', () => {
@@ -454,7 +467,7 @@ describe('wiring (source markers)', () => {
   });
 
   test('the running flag is taken synchronously, before the first await (a fast double click)', () => {
-    const runStart = app.indexOf('const runLoveImport = useCallback');
+    const runStart = app.indexOf('const runLoveImport = React.useCallback');
     const tryAt = app.indexOf('try {', runStart);
     const flagAt = app.indexOf('loveImportRunningRef.current = { ...loveImportRunningRef.current, [service]: true };', runStart);
     expect(tryAt).toBeGreaterThan(-1);
@@ -467,10 +480,10 @@ describe('wiring (source markers)', () => {
   });
 
   test('the love-push re-check drops gone tracks from the retry queue (unique to pushLoveToScrobblers, not the backfill walk)', () => {
-    const pushStart = app.indexOf('const pushLoveToScrobblers = useCallback');
-    const pushEnd = app.indexOf('const markLovePushed = useCallback', pushStart);
+    const pushStart = app.indexOf('const pushLoveToScrobblers = React.useCallback');
+    const pushEnd = app.indexOf('const markLovePushed = React.useCallback', pushStart);
     const pushBody = app.slice(pushStart, pushEnd);
-    expect(pushBody).toContain("pushLoveToScrobblers = useCallback(async (track, { justAdded = false } = {}) => {");
+    expect(pushBody).toContain("pushLoveToScrobblers = React.useCallback(async (track, { justAdded = false } = {}) => {");
     expect(pushBody).toContain('removed from the collection since the love was queued');
     expect(pushBody).toContain('loveRetryQueueRef.current.delete(track.id);');
   });
